@@ -1,10 +1,10 @@
 # SurgeryOCR
 
-## 描述 (Description)
+## Description
 
 Analyzes ophthalmological surgery videos to extract and label on-screen numerical data representing different surgical stages using Optical Character Recognition (OCR).
 
-## 專案目標 (Project Goals)
+## Project Goals
 
 This project aims to automate the extraction and labeling of critical numerical data displayed within ophthalmological surgery videos. By leveraging Optical Character Recognition (OCR) techniques, the repository provides tools to:
 
@@ -12,7 +12,7 @@ This project aims to automate the extraction and labeling of critical numerical 
 * Label these extracted numbers based on the specific stage of the surgery they correspond to.
 * Provide a structured dataset for further analysis of surgical procedures, potentially leading to insights for research, training, and quality improvement in ophthalmology.
 
-## 主要功能 (Key Features)
+## Key Features
 
 * **Video Analysis:** Processes ophthalmological surgery videos as input.
 * **On-Screen OCR:** Employs OCR to recognize numerical data displayed on the video frames.
