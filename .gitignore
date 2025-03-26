@@ -1,0 +1,24 @@
+# --- Python / Editor / System 常見忽略 ---
+__pycache__/
+*.py[cod]
+*.swp
+.*.swp
+.ipynb_checkpoints/
+.DS_Store
+
+# --- 若有虛擬環境 venv ---
+venv/
+.venv/
+env/
+ENV/
+
+
+*.mp4
+*.zip
+*.safetensors
+*.pth
+*.ckpt
+*.bin
+*.zip
+*.mp4
+# --- 忽略某些可能過大的檔案或資料夾 ---
