@@ -12,7 +12,8 @@ venv/
 env/
 ENV/
 
-
+# --- 忽略所有資料夾內層內的png---
+**/*.png
 *.mp4
 *.zip
 *.safetensors
