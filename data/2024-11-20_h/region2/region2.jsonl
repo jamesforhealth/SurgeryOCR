@@ -22206,7 +22206,7 @@
 {"query": "<image>", "response": "3", "images": "2024-11-20_h/region2/frame_26551.png"}
 {"query": "<image>", "response": "3", "images": "2024-11-20_h/region2/frame_26552.png"}
 {"query": "<image>", "response": "-1", "images": "2024-11-20_h/region2/frame_26553.png"}
-{"query": "<image>", "response": "1", "images": "2024-11-20_h/region2/frame_26554.png"}
+{"query": "<image>", "response": "-1", "images": "2024-11-20_h/region2/frame_26554.png"}
 {"query": "<image>", "response": "-1", "images": "2024-11-20_h/region2/frame_26555.png"}
 {"query": "<image>", "response": "-1", "images": "2024-11-20_h/region2/frame_26556.png"}
 {"query": "<image>", "response": "-1", "images": "2024-11-20_h/region2/frame_26557.png"}
@@ -27022,7 +27022,7 @@
 {"query": "<image>", "response": "28 36", "images": "2024-11-20_h/region2/frame_31367.png"}
 {"query": "<image>", "response": "28 36", "images": "2024-11-20_h/region2/frame_31368.png"}
 {"query": "<image>", "response": "28 36", "images": "2024-11-20_h/region2/frame_31369.png"}
-{"query": "<image>", "response": "36 28   ", "images": "2024-11-20_h/region2/frame_31370.png"}
+{"query": "<image>", "response": "28 36", "images": "2024-11-20_h/region2/frame_31370.png"}
 {"query": "<image>", "response": "28 36", "images": "2024-11-20_h/region2/frame_31371.png"}
 {"query": "<image>", "response": "28 36", "images": "2024-11-20_h/region2/frame_31372.png"}
 {"query": "<image>", "response": "28 36", "images": "2024-11-20_h/region2/frame_31373.png"}

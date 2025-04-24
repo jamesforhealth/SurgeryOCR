@@ -667,6 +667,57 @@ def evaluate_model(model, data_loader, criterion, device, threshold=0.5):
         'neg_recall': neg_recall
     }
 
+# --- 新增 API 函數 ---
+def predict_single_pair_change(img1_pil, img2_pil, model, transform, device, threshold=0.5, loss_type="contrastive"):
+    """
+    預測單個圖像對之間是否存在變化。
+
+    Args:
+        img1_pil (PIL.Image): 第一張圖像 (例如，前一幀的 ROI)。
+        img2_pil (PIL.Image): 第二張圖像 (例如，當前幀的 ROI)。
+        model (torch.nn.Module): 已載入的 SiameseNetwork 模型。
+        transform (callable): 應用於圖像的預處理轉換。
+        device (torch.device): 運行模型的設備 ('cuda' 或 'cpu')。
+        threshold (float): 判斷變化的閾值。
+                           對於 contrastive loss，距離 > threshold 通常表示不同（變化）。
+                           對於 BCE loss，概率 > threshold 通常表示是同一類（無變化）。
+        loss_type (str): 模型訓練時使用的損失類型 ('contrastive' 或 'BCE')，影響閾值解釋。
+
+    Returns:
+        bool: True 表示檢測到變化，False 表示未檢測到變化。
+    """
+    if not model or not transform:
+        print("錯誤: 模型或轉換未提供。")
+        return True # 或者拋出異常，默認返回檢測到變化可能更安全
+
+    model.eval() # 確保模型在評估模式
+
+    try:
+        # 應用轉換並添加 batch 維度
+        img1_tensor = transform(img1_pil).unsqueeze(0).to(device)
+        img2_tensor = transform(img2_pil).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            if loss_type == "contrastive":
+                output1, output2 = model(img1_tensor, img2_tensor)
+                distance = F.pairwise_distance(output1, output2).item()
+                # 距離越大，越不像。如果距離超過閾值，則認為有變化。
+                is_change = distance > threshold
+            elif loss_type == "BCE":
+                # 假設模型輸出的是 "無變化" 的概率
+                probability = model(img1_tensor, img2_tensor).sigmoid().item()
+                # 如果 "無變化" 的概率 低於 閾值，則認為有變化。
+                is_change = probability < threshold
+            else:
+                print(f"錯誤: 不支持的損失類型 '{loss_type}' 用於預測。")
+                return True # 默認有變化
+
+        return is_change
+
+    except Exception as e:
+        print(f"預測單個圖像對變化時出錯: {e}")
+        return True # 出錯時默認檢測到變化
+
 # -------------------------------
 # 主函数
 # -------------------------------

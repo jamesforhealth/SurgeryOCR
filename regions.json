@@ -1,0 +1,156 @@
+[
+  {
+    "coords": [
+      1647,
+      114,
+      1836,
+      150
+    ],
+    "binarize": false,
+    "threshold": 150,
+    "allowed_chars": "0123456789.",
+    "invert": false,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      1644,
+      330,
+      1830,
+      387
+    ],
+    "binarize": true,
+    "threshold": 150,
+    "allowed_chars": "0123456789",
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      1640,
+      445,
+      1836,
+      525
+    ],
+    "binarize": true,
+    "threshold": 170,
+    "allowed_chars": "-0123456789 ",
+    "invert": true,
+    "default_content": "0"
+  },
+  {
+    "coords": [
+      1640,
+      570,
+      1835,
+      645
+    ],
+    "binarize": true,
+    "threshold": 150,
+    "allowed_chars": "0123456789+ \n",
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      1560,
+      60,
+      1635,
+      145
+    ],
+    "binarize": false,
+    "threshold": 140,
+    "allowed_chars": "0123456789",
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      1475,
+      70,
+      1545,
+      140
+    ],
+    "binarize": false,
+    "threshold": 150,
+    "allowed_chars": null,
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      65,
+      575,
+      220,
+      655
+    ],
+    "binarize": false,
+    "threshold": 150,
+    "allowed_chars": "0123456789 \n",
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      65,
+      215,
+      220,
+      270
+    ],
+    "binarize": true,
+    "threshold": 150,
+    "allowed_chars": "0123456789",
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      609,
+      57,
+      891,
+      90
+    ],
+    "binarize": false,
+    "threshold": 150,
+    "allowed_chars": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxys",
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      609,
+      96,
+      891,
+      129
+    ],
+    "binarize": false,
+    "threshold": 150,
+    "allowed_chars": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxys",
+    "invert": true,
+    "default_content": ""
+  },
+  {
+    "coords": [
+      66,
+      57,
+      597,
+      90
+    ],
+    "binarize": true,
+    "threshold": 150,
+    "allowed_chars": null,
+    "invert": false
+  },
+  {
+    "coords": [
+      66,
+      99,
+      594,
+      132
+    ],
+    "binarize": true,
+    "threshold": 150,
+    "allowed_chars": null,
+    "invert": false
+  }
+]
