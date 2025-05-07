@@ -28,9 +28,13 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import tkinter.font as tkFont # For bold font in Treeview
+from tkinter import TclError
 import csv
 import easyocr
 import torch
+import shutil
+import tempfile
+import traceback
 
 # ---------------- OCR 接口 ----------------
 class OCRModelInterface:
@@ -136,7 +140,7 @@ class EasyOCRInterface:
         try:
             res = self.reader.readtext(
                 np.array(pil_img),
-                allowlist="0123456789.",
+                allowlist="0123456789-",
                 detail=0,
                 paragraph=False
             )
@@ -227,6 +231,20 @@ class VideoAnnotator(tk.Frame):
             anchor=tk.W
         )
         self.lbl_status.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # 創建 TreeView 後添加點擊事件綁定
+        self.tree.bind('<<TreeviewSelect>>', self._on_treeview_select)
+
+        # 為 TreeView 設置雙擊事件（可以用於編輯）
+        self.tree.bind("<Double-1>", self._on_edit_annotation)
+
+        self.tree.bind("<Return>", self._on_edit_annotation)
+        
+        # 設置右鍵選單
+        self._setup_treeview_context_menu()
+        
+        # 添加一個變數來追踪是否有未保存的更改
+        self.changes_made = False
 
     def _create_widgets(self):
         """創建 GUI 界面元素"""
@@ -474,10 +492,17 @@ class VideoAnnotator(tk.Frame):
             else:
                  self.roi_coords = None # 無法應用默認值
 
-            # --- 重新讀取並顯示第一幀 ---
-            self._show_frame(0) # Display the first frame
+            # --- 新增：嘗試載入現有標註 ---
+            self._load_annotations() # 會自動填充 TreeView 並跳轉
 
-            self._update_status_bar("影片加載完成，開始自動分析…")
+            # 如果 _load_annotations 沒有跳轉 (例如沒有標註檔)，則顯示第一幀
+            if not self.tree.get_children():
+                 self._show_frame(0)
+            # ------------------------------
+
+            self._update_status_bar(f"影片 '{self.video_file_path.name}' 已載入")
+            # 移除或註解掉任何自動開始分析的舊程式碼
+            # self._start_analysis() # <--- 確保這裡沒有自動開始
 
         except (IOError, ValueError, Exception) as e:
             messagebox.showerror("錯誤", f"加載影片失敗: {e}")
@@ -540,7 +565,7 @@ class VideoAnnotator(tk.Frame):
                 # -------- EasyOCR 與信心過濾 --------
                 results = self.ocr_iface.reader.readtext(
                     np.array(roi_pil),
-                    allowlist="0123456789.",
+                    allowlist="0123456789-",
                     detail=1, paragraph=False
                 )
                 # 記錄 bbox
@@ -771,7 +796,7 @@ class VideoAnnotator(tk.Frame):
         # 直接呼叫 reader，拿完整 (bbox, text, conf)
         results = self.ocr_iface.reader.readtext(
             np.array(roi_pil),
-            allowlist="0123456789.",
+            allowlist="0123456789-",
             detail=1, paragraph=False
         )
         print(f"[OCR] frame {frame_idx}:")
@@ -848,44 +873,171 @@ class VideoAnnotator(tk.Frame):
                 break
         # 不改變 UI VideoCapture (self.cap_ui) 的當前位置
 
+    def _fill_and_get_records(self, tree_items: list) -> list:
+        """
+        接收 TreeView 的項目列表，填充缺失的幀，並返回包含所有連續幀記錄的完整列表。
+        """
+        if not tree_items:
+            return []
+        if not self.video_file_path: # 需要影片名稱來建構 image 路徑
+            print("錯誤：無法填充記錄，因為影片路徑未設定。")
+            return []
+
+        video_name = self.video_file_path.stem
+        records_by_frame = {}
+        min_frame = float('inf')
+        max_frame = float('-inf')
+
+        # 1. 從 TreeView 項目中提取數據
+        print("正在從 TreeView 提取標註...")
+        for iid in tree_items:
+            item_data = self.tree.item(iid)
+            values = item_data.get("values", [])
+            if not values or len(values) < 2:
+                print(f"警告：跳過 TreeView 中格式不符的項目 {iid}")
+                continue
+            try:
+                frame_idx = int(values[0])
+                # 直接儲存 response 字串
+                response_text = str(values[1]) if values[1] is not None else ""
+                records_by_frame[frame_idx] = response_text
+                min_frame = min(min_frame, frame_idx)
+                max_frame = max(max_frame, frame_idx)
+            except (ValueError, IndexError) as e:
+                print(f"警告：解析 TreeView 項目 {iid} 時出錯 ({e})，已跳過")
+                continue
+
+        if not records_by_frame:
+            print("資訊：TreeView 中沒有有效的標註可供填充。")
+            return []
+
+        # 檢查是否有有效的幀範圍
+        if min_frame == float('inf') or max_frame == float('-inf'):
+             print("錯誤：無法從 TreeView 確定有效的幀範圍。")
+             return []
+
+        print(f"從 TreeView 提取記錄範圍：幀 {min_frame} 到 {max_frame}")
+
+        filled_records = []
+        last_known_response = "" # 初始值
+
+        print(f"正在填充從 {min_frame} 到 {max_frame} 的所有幀...")
+        # 確保按幀號順序處理原始記錄
+        sorted_original_frames = sorted(records_by_frame.keys())
+        original_record_idx = 0
+
+        for current_frame in range(min_frame, max_frame + 1):
+            # 檢查原始記錄中是否有當前幀
+            if original_record_idx < len(sorted_original_frames) and sorted_original_frames[original_record_idx] == current_frame:
+                # 使用原始記錄 (來自 TreeView)
+                response = records_by_frame[current_frame]
+                last_known_response = response # 更新最後已知的 response
+                region_name = getattr(self, "region_name", "region2")  # 預設為 "region2"
+                image_path = f"{video_name}/{region_name}/frame_{current_frame}.png"
+                record = {
+                    "query": "<image>",
+                    "response": response,
+                    "images": image_path
+                }
+                filled_records.append(record)
+                original_record_idx += 1
+            else:
+                # 填充缺失的幀
+                image_path = f"{video_name}/region2/frame_{current_frame}.png"
+                new_record = {
+                    "query": "<image>",
+                    "response": last_known_response, # 使用上一個已知幀的 response
+                    "images": image_path
+                }
+                filled_records.append(new_record)
+
+        print(f"填充完成，總共 {len(filled_records)} 筆記錄。")
+        return filled_records
+
     def _save_annotations(self):
-        """Saves the current annotations and cached results to a JSONL file."""
-        if not self.video_file_path:
-            messagebox.showwarning("未載入影片", "請先載入影片再儲存標註。")
+        """將 TreeView 中的資料填充後儲存為包含所有連續幀的 JSONL 格式"""
+        # 同時儲存變化幀列表
+        self._save_change_frames()
+
+        save_path = self._get_save_path()
+        if not save_path:
+            print("錯誤：無法獲取儲存路徑。")
+            self._update_status_bar("儲存失敗：無法獲取路徑")
             return
 
-        save_path = self._get_save_path(".jsonl")
-        if not save_path:
-             messagebox.showerror("儲存失敗", "無法確定儲存路徑。")
+        if not self.video_file_path:
+            print("錯誤：影片路徑未設定，無法儲存。")
+            self._update_status_bar("儲存失敗：未載入影片")
+            return
+
+        tree_items = self.tree.get_children()
+        if not tree_items:
+            print("資訊：TreeView 中沒有標註可儲存。")
+            # 儲存一個空的檔案
+            try:
+                save_path.parent.mkdir(parents=True, exist_ok=True) # 確保目錄存在
+                with open(save_path, "w", encoding="utf-8") as f:
+                    pass # 寫入空內容
+                self._update_status_bar(f"已儲存空的標註檔至 {save_path.name}")
+                print(f"已儲存空的標註檔至：{save_path}")
+            except IOError as e:
+                print(f"錯誤：儲存空的標註檔失敗：{e}")
+                self._update_status_bar(f"儲存失敗：{e}")
+            return
+
+        # --- 呼叫填充函數 ---
+        filled_records = self._fill_and_get_records(tree_items)
+        # --------------------
+
+        if not filled_records:
+             print("錯誤：填充記錄失敗或無有效記錄，無法儲存。")
+             self._update_status_bar("儲存失敗：填充記錄錯誤")
              return
 
-        self._save_to_file(save_path)
-
-        # --- Also save ROI images ---
-        roi_save_dir = save_path.parent / "roi_images"
+        # --- 使用臨時檔案安全地寫入填充後的記錄 ---
+        temp_file_path = None
         try:
-            roi_save_dir.mkdir(parents=True, exist_ok=True)
-            print(f"正在儲存 ROI 圖像到: {roi_save_dir}")
-            saved_roi_count = 0
-            with self.save_lock: # Protect access to roi_image_cache while iterating
-                roi_items = list(self.roi_image_cache.items()) # Create a copy to iterate
+            # 在與目標文件相同的目錄下創建臨時文件
+            save_path.parent.mkdir(parents=True, exist_ok=True) # 再次確保目錄存在
+            temp_fd, temp_path_str = tempfile.mkstemp(dir=save_path.parent, prefix=save_path.stem + '_', suffix='.tmp')
+            temp_file_path = Path(temp_path_str)
 
-            for frame_idx, img_pil in tqdm(roi_items, desc="儲存 ROI 圖像"):
-                if img_pil:
-                    try:
-                        img_filename = roi_save_dir / f"frame_{frame_idx}.png"
-                        img_pil.save(img_filename, "PNG")
-                        saved_roi_count += 1
-                    except Exception as e:
-                        print(f"警告：無法儲存幀 {frame_idx} 的 ROI 圖像: {e}")
-            print(f"成功儲存 {saved_roi_count} 個 ROI 圖像。")
-            self.lbl_status.config(text=f"標註和 {saved_roi_count} 個 ROI 圖像已儲存")
+            print(f"正在寫入臨時文件：{temp_file_path}")
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as outfile:
+                for record in filled_records:
+                    outfile.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-        except OSError as e:
-            print(f"警告：無法創建 ROI 圖像儲存目錄 {roi_save_dir}: {e}")
-            messagebox.showwarning("ROI 儲存警告", f"無法創建目錄儲存 ROI 圖像:\n{roi_save_dir}")
+            # 用臨時文件替換原始文件
+            print(f"正在用臨時文件覆寫目標文件：{save_path}")
+            shutil.move(str(temp_file_path), str(save_path)) # 原子性替換
+            print("文件覆寫成功。")
+            self._update_status_bar(f"標註已填充並儲存至 {save_path.name} ({len(filled_records)} 幀)")
+
+        except IOError as e:
+            print(f"錯誤：寫入臨時文件或覆寫文件時出錯: {e}")
+            self._update_status_bar(f"儲存失敗：{e}")
+            # 出錯時嘗試刪除臨時文件
+            if temp_file_path and temp_file_path.exists():
+                try:
+                    temp_file_path.unlink()
+                    print(f"已刪除臨時文件：{temp_file_path}")
+                except OSError as unlink_e:
+                    print(f"錯誤：刪除臨時文件失敗: {unlink_e}")
         except Exception as e:
-             print(f"儲存 ROI 圖像時發生未知錯誤: {e}")
+            print(f"儲存標註時發生未知錯誤: {e}")
+            self._update_status_bar(f"儲存時發生錯誤: {e}")
+            if temp_file_path and temp_file_path.exists():
+                 try:
+                     temp_file_path.unlink()
+                 except OSError:
+                     pass # 可能已被移動，忽略錯誤
+        finally:
+            # 確保即使移動成功，也不會意外地保留對臨時文件的引用
+             if temp_file_path and temp_file_path.exists():
+                 try:
+                     temp_file_path.unlink()
+                 except OSError:
+                     pass # 可能已被移動，忽略錯誤
 
     def _save_to_file(self, file_path: Path):
         """Internal function to save data to the specified JSONL file."""
@@ -935,73 +1087,219 @@ class VideoAnnotator(tk.Frame):
             self.lbl_status.config(text="儲存失敗")
 
     def _load_annotations(self):
-        """Loads annotations from a JSONL file if it exists."""
-        load_path = self._get_save_path(".jsonl")
-        if load_path and load_path.exists():
-            print(f"檢測到標註文件，正在載入: {load_path}")
-            try:
-                loaded_count = 0
-                with open(load_path, 'r', encoding='utf-8') as f:
-                    for line in f:
+        """從 JSONL 檔案載入標註並更新 TreeView"""
+        load_path = self._get_save_path() # 會得到 data/<影片名>/region2.jsonl
+        if not load_path or not load_path.exists():
+            print(f"資訊：未找到現有標註文件。")
+            return
+
+        print(f"檢測到標註文件，正在載入: {load_path}")
+        try:
+            # 清空 TreeView
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            records = []  # 儲存所有記錄
+            prev_response = None
+            loaded_count = 0
+            change_frames = []  # 用於存儲幀內容發生變化的幀號
+            
+            with open(load_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        record = json.loads(line.strip())
+                        response_text = record.get("response", "")
+                        image_path = record.get("images", "")
+
+                        # 從 image_path 解析 frame_idx
+                        filename = Path(image_path).name
+                        if not filename.startswith("frame_") or not filename.endswith(".png"):
+                            print(f"警告：跳過無效的 image_path: {image_path}")
+                            continue
+                        
+                        frame_idx_str = filename[len("frame_"):-len(".png")]
                         try:
-                            record = json.loads(line)
-                            frame_idx = record.get("frame")
-                            annotation = record.get("annotation")
-                            ocr_text = record.get("ocr_text") # Load OCR text too
-                            changed = record.get("changed")   # Load change status
+                            frame_idx = int(frame_idx_str)
+                        except ValueError:
+                            print(f"警告：無法從 {filename} 解析出有效的幀號")
+                            continue
+                        
+                        # 記錄所有讀取到的標註
+                        records.append((frame_idx, response_text))
+                        
+                        # 檢查這一幀的內容是否與前一幀不同
+                        if prev_response != response_text:
+                            change_frames.append(frame_idx)
+                            prev_response = response_text
+                        
+                        loaded_count += 1
+                    except json.JSONDecodeError:
+                        print(f"警告：JSON 解析錯誤，跳過此行")
+                        continue
+                    except (ValueError, KeyError, AttributeError) as e:
+                        print(f"警告：處理記錄時出錯 ({e})，跳過此行")
+                        continue
 
-                            if frame_idx is not None:
-                                # Prioritize non-empty annotation
-                                if annotation:
-                                    self.annotations[frame_idx] = annotation
-                                elif ocr_text: # If annotation empty but OCR exists, use OCR as initial annotation
-                                     self.annotations[frame_idx] = ocr_text
+                # 對於很大的檔案，我們只將 change_frames 添加到 TreeView
+                print(f"從檔案中讀取了 {loaded_count} 條記錄，其中 {len(change_frames)} 幀內容有變化")
+                
+                # 如果記錄數量很大，只加載變化的幀到 TreeView
+                for frame_idx in change_frames:
+                    # 找到對應的 response
+                    for r_idx, r_text in records:
+                        if r_idx == frame_idx:
+                            self.tree.insert("", "end", values=(frame_idx, r_text))
+                            break
+                
+                # 更新 TreeView 排序
+                self._sort_tree_by_frame()
+                
+                # 儲存變化幀列表到 region2_change.jsonl
+                self._save_change_frames(change_frames)
+                
+                self._update_status_bar(f"已從 {load_path.name} 載入 {len(change_frames)} 個變化幀 (共 {loaded_count} 條記錄)")
+                print(f"從文件載入 {len(change_frames)} 條變化幀的標註/緩存。")
 
-                                # Pre-populate caches if not already processed by background tasks
-                                # Check if value exists before overwriting potentially newer cache data? No, load should overwrite.
-                                if ocr_text is not None:
-                                     self.ocr_cache[frame_idx] = ocr_text
-                                if changed is not None:
-                                     self.change_cache[frame_idx] = changed
+                # 跳轉到第一筆記錄
+                if change_frames:
+                    first_frame = change_frames[0]
+                    self.current_frame_idx = first_frame - 1  # 調整為前一幀
+                    self._update_slider_position(first_frame)
+                    self._load_and_show_frame_by_number(first_frame)  # 顯示第一個變化幀
+            
+            # 更新緩存
+            self.annotations = {frame_idx: resp for frame_idx, resp in records}
+            
+        except IOError as e:
+            print(f"錯誤：讀取標註文件時發生 IO 錯誤: {e}")
+            self._update_status_bar(f"載入標註失敗: {e}")
+        except Exception as e:
+            print(f"載入標註時發生未知錯誤: {e}")
+            self._update_status_bar(f"載入標註時出錯: {e}")
 
-                                loaded_count += 1
-                        except json.JSONDecodeError:
-                            print(f"警告：跳過無法解析的行: {line.strip()}")
-                        except Exception as e:
-                            print(f"警告：處理標註記錄時出錯: {e}")
-
-                print(f"從文件載入 {loaded_count} 條記錄的標註/緩存。")
-                # TreeView will be populated/updated by _show_frame and _poll_queue
-
-            except IOError as e:
-                print(f"警告：無法讀取標註文件 {load_path}: {e}")
-            except Exception as e:
-                print(f"警告：載入標註時發生未知錯誤: {e}")
-        else:
-            print("未找到現有標註文件。")
-
-    def _get_save_path(self, suffix=".jsonl") -> Optional[Path]:
-        """Determines the path for saving/loading annotations based on video path."""
+    def _get_save_path(self, suffix=None):
+        """
+        獲取標註檔案的儲存路徑
+        Args:
+            suffix: 可選的文件後綴，如 ".jsonl"。如果提供，則附加到文件名後。
+        Returns:
+            Path: data/<影片名>/region2.jsonl 或自定義路徑
+        """
         if not self.video_file_path:
             return None
-        # Save in a subdirectory named after the video file, inside 'data' or script dir
-        video_dir = self.video_file_path.parent
+        
         video_name = self.video_file_path.stem
-        # Try to create a 'results' subdirectory relative to the video
-        save_dir = video_dir / f"{video_name}_annotations"
+        save_dir = Path("data") / video_name
+        
+        # 使用類的屬性或配置來獲取區域名稱，而不是硬編碼
+        region_name = getattr(self, "region_name", "region2")  # 預設為 "region2"
+        
+        if suffix:
+            return save_dir / f"{region_name}{suffix}"
+        else:
+            return save_dir / f"{region_name}.jsonl"
+
+
+    def _save_change_frames(self, change_frames=None):
+        """將發生內容變化的幀號儲存到 region_change.jsonl 文件中"""
+        if not self.video_file_path:
+            return
+        
+        # 如果沒有提供 change_frames，則從 TreeView 中提取
+        if change_frames is None:
+            change_frames = []
+            for iid in self.tree.get_children():
+                try:
+                    frame_idx = int(self.tree.item(iid)["values"][0])
+                    change_frames.append(frame_idx)
+                except (IndexError, ValueError):
+                    continue
+        
+        if not change_frames:
+            print("沒有檢測到變化幀，不創建 change frames 文件")
+            return
+        
+        # 獲取區域名稱，使用 getattr 避免硬編碼
+        region_name = getattr(self, "region_name", "region2")  # 預設為 "region2"
+        
+        # 構建變化幀文件路徑
+        video_name = self.video_file_path.stem
+        save_dir = Path("data") / video_name
+        change_path = save_dir / f"{region_name}_change.jsonl"
+        
         try:
+            # 創建目錄（如果不存在）
             save_dir.mkdir(parents=True, exist_ok=True)
-            # Use ROI coords in filename for uniqueness if multiple ROIs are analyzed later
-            roi_str = f"roi_{self.roi_coords[0]}_{self.roi_coords[1]}_{self.roi_coords[2]}_{self.roi_coords[3]}"
-            save_filename = f"{video_name}_{roi_str}{suffix}"
-            return save_dir / save_filename
-        except OSError as e:
-            print(f"警告：無法創建儲存目錄 {save_dir}: {e}")
-            # Fallback to saving alongside the video file
-            return video_dir / f"{video_name}_annotations{suffix}"
+            
+            # 使用臨時文件進行安全寫入
+            temp_fd, temp_path_str = tempfile.mkstemp(dir=save_dir, prefix=f"{region_name}_change_", suffix=".tmp")
+            temp_file_path = Path(temp_path_str)
+            
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                # 按照幀號排序
+                for frame in sorted(change_frames):
+                    # 使用簡單的格式，只存儲幀號
+                    f.write(json.dumps({"frame": frame}) + "\n")
+            
+            # 用臨時文件安全地替換目標文件
+            shutil.move(str(temp_file_path), str(change_path))
+            print(f"已儲存 {len(change_frames)} 個變化幀到 {change_path}")
+        except Exception as e:
+            print(f"儲存變化幀列表時出錯: {e}")
+            if 'temp_file_path' in locals() and temp_file_path.exists():
+                try:
+                    temp_file_path.unlink()
+                except:
+                    pass
+
+    def _sort_tree_by_frame(self):
+        """按幀號排序 TreeView 的項目"""
+        items = [(int(self.tree.set(iid, "frame")), iid) for iid in self.tree.get_children()]
+        items.sort()
+        for index, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", index)
 
     def _on_close(self):
-        """Handles window closing: stops threads and saves intermediate results."""
+        """處理窗口關閉：停止線程並儲存標註進度。"""
+        print("關閉應用程式...")
+        self.stop_event.set() # 通知線程停止
+
+        # --- 新增：儲存當前 TreeView 內容 ---
+        # 檢查是否有影片載入且 TreeView 中有內容
+        if self.video_file_path and self.tree.get_children():
+            # --- 選項 A：總是自動儲存 ---
+            print("正在自動儲存標註進度...")
+            self._save_annotations()
+            # --- 選項 B：詢問使用者是否儲存 (取消註解以使用) ---
+            # if messagebox.askyesno("儲存進度?", "是否在關閉前儲存當前標註進度?"):
+            #     print("正在儲存標註進度...")
+            #     self._save_annotations()
+            # else:
+            #     print("使用者選擇不儲存進度。")
+        else:
+            print("無需儲存標註 (未載入影片或無標註內容)。")
+        # ---------------------------------
+
+        # 等待線程結束 (可選，但建議加入以確保資源完全釋放)
+        if self.analysis_thread and self.analysis_thread.is_alive():
+            print("等待分析線程結束...")
+            self.analysis_thread.join(timeout=1.0) # 等待最多 1 秒
+            if self.analysis_thread.is_alive():
+                print("警告：分析線程未在預期時間內結束。")
+
+        # 釋放影片資源 (保持不變)
+        print("釋放 VideoCapture 資源...")
+        for cap in (self.cap_ui, self.cap_detect, self.cap_ocr):
+            if cap:
+                try:
+                    cap.release()
+                except Exception as e:
+                    print(f"關閉時釋放 VideoCapture 出錯: {e}")
+
+        # 銷毀主窗口 (保持不變)
+        print("銷毀主窗口...")
+        self.master.destroy()
+        print("應用程式已關閉。")
         print("關閉應用程式...")
         self.stop_event.set() # Signal threads to stop
 
@@ -1011,15 +1309,15 @@ class VideoAnnotator(tk.Frame):
         self._finalize_close() # Close directly for now
 
     def _finalize_close(self):
-        """Performs the final steps of closing after signaling threads."""
-         # Optional: Ask user if they want to save before closing
-        save_path = self._get_save_path(".jsonl")
-        if self.video_file_path and (self.annotations or self.ocr_cache): # Check if there's data
-             if messagebox.askyesno("儲存進度?", "是否在關閉前儲存當前標註進度?"):
-                  if save_path:
-                      self._save_to_file(save_path) # Save only JSONL, not ROIs again
-                  else:
-                      messagebox.showwarning("無法儲存", "無法確定儲存路徑。")
+        # """Performs the final steps of closing after signaling threads."""
+        #  # Optional: Ask user if they want to save before closing
+        # save_path = self._get_save_path(".jsonl")
+        # if self.video_file_path and (self.annotations or self.ocr_cache): # Check if there's data
+        #      if messagebox.askyesno("儲存進度?", "是否在關閉前儲存當前標註進度?"):
+        #           if save_path:
+        #               self._save_to_file(save_path) # Save only JSONL, not ROIs again
+        #           else:
+        #               messagebox.showwarning("無法儲存", "無法確定儲存路徑。")
 
         # Release video captures
         print("釋放 VideoCapture 資源...")
@@ -1068,20 +1366,47 @@ class VideoAnnotator(tk.Frame):
             messagebox.showinfo("提示", "請先載入影片再開始分析。")
             return
 
-        self.analysis_start_idx = int(self.slider_var.get())
-
         if self.analysis_thread and self.analysis_thread.is_alive():
             messagebox.showinfo("提示", "分析已在進行中。")
             return
 
+        # --- 修改：決定起始幀號 ---
+        last_analyzed_frame = -1
+        if self.tree.get_children(): # 檢查 TreeView 是否有內容
+            try:
+                # 獲取 TreeView 中所有項目的幀號並找到最大值
+                all_frames = [int(self.tree.set(iid, "frame")) for iid in self.tree.get_children()]
+                if all_frames:
+                    last_analyzed_frame = max(all_frames)
+            except ValueError:
+                print("警告：無法解析 TreeView 中的幀號，將從頭開始分析。")
+                last_analyzed_frame = -1 # 出錯則重置
+
+        # 如果有上次分析的記錄，從下一幀開始；否則從滑桿當前位置開始
+        self.analysis_start_idx = last_analyzed_frame + 1 if last_analyzed_frame >= 0 else int(self.slider_var.get())
+
+        # 確保起始幀號不超過總幀數
+        if self.analysis_start_idx >= self.total_frames:
+             messagebox.showinfo("提示", "所有幀似乎都已分析過。")
+             self._update_status_bar("所有幀已分析")
+             return
+        # --------------------------
+
         self.stop_event.clear()
         self.analysis_thread = threading.Thread(
             target=self._analysis_worker,
-            args=(self.analysis_start_idx,),
+            args=(self.analysis_start_idx,), # 使用計算出的起始幀號
             daemon=True
         )
         self.analysis_thread.start()
 
+        # 進度條設定 (保持不變)
+        self.progressbar.configure(maximum=self.total_frames-1)
+        self.progress_var.set(self.analysis_start_idx)
+        self.lbl_prog.config(
+            text=f"進度: {self.analysis_start_idx}/{self.total_frames-1}"
+        )
+        self._update_status_bar(f"從幀 {self.analysis_start_idx} 開始分析…")
         # 進度條
         self.progressbar.configure(maximum=self.total_frames-1)
         self.progress_var.set(self.analysis_start_idx)
@@ -1122,6 +1447,512 @@ class VideoAnnotator(tk.Frame):
             self.status_var.set(text)
             # 立即刷新，避免 UI 卡住
             self.lbl_status.update_idletasks()
+
+    # 1. 修改開啟影片的函數，加入清理舊資料和檢測進度的邏輯
+    def _open_video(self):
+        """開啟並載入影片文件"""
+        filetypes = [
+            ("Video files", "*.mp4 *.avi *.mov *.mkv"),
+            ("All files", "*.*")
+        ]
+        video_path = filedialog.askopenfilename(filetypes=filetypes, title="選擇影片文件")
+        if not video_path:
+            return False
+        
+        # 清理舊影片的資料和UI
+        self._clear_previous_video_data()
+        
+        # 載入新影片
+        self.video_file_path = Path(video_path)
+        self.video_title = self.video_file_path.stem
+        
+        # 設置影片輸入
+        try:
+            success = self._setup_video_input(self.video_file_path)
+            if not success:
+                self._update_status_bar("影片載入失敗")
+                return False
+            
+            self._update_status_bar(f"已載入: {self.video_title} ({self.total_frames} 幀)")
+            
+            # 載入現有標註（如果有）以及變化幀列表
+            self._load_existing_data()
+            
+            # 檢查是否有分析進度，並自動跳轉
+            self._check_and_jump_to_analysis_position()
+            
+            return True
+        except Exception as e:
+            messagebox.showerror("載入失敗", f"影片載入出錯:\n{e}")
+            print(f"載入影片時發生錯誤: {e}")
+            traceback.print_exc()  # 打印詳細錯誤堆疊
+            self._update_status_bar("影片載入失敗")
+            return False
+
+    # 2. 新增函數用於清理上一個影片的資料和UI
+    def _clear_previous_video_data(self):
+        """清理上一個影片的資料和UI"""
+        # 停止可能正在運行的處理線程
+        if hasattr(self, 'tmad_detector') and self.tmad_detector:
+            self.tmad_detector.stop()
+        if hasattr(self, 'ocr_iface') and self.ocr_iface:
+            self.ocr_iface.stop()
+        
+        # 清空所有緩存
+        self.annotations = {}
+        self.ocr_cache = {}
+        self.change_cache = {}
+        self.roi_image_cache = {}
+        
+        # 清空隊列
+        while not self.detect_queue.empty():
+            try:
+                self.detect_queue.get_nowait()
+            except:
+                pass
+        
+        # 重置 UI 元素
+        # 清空 TreeView
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # 重置影像顯示
+        self.lbl_img.config(image="")
+        self.lbl_roi.config(image="")
+        
+        # 重置影片相關變數
+        self.current_frame_idx = 0
+        self.total_frames = 0
+        self.video_file_path = None
+        self.video_title = ""
+        
+        # 重置狀態和進度
+        self.lbl_status.config(text="就緒")
+        self.lbl_frame_num.config(text="幀: 0 / 0")
+        self.slider_var.set(0)
+        
+        # 更新窗口標題
+        self.title(f"影片標註工具")
+        
+        print("已清理上一個影片的資料和 UI")
+
+    # 3. 新增函數用於檢查分析進度並自動跳轉
+    def _check_and_jump_to_analysis_position(self):
+        """檢查是否有分析進度，並自動跳轉到應該繼續的位置"""
+        if not self.video_file_path or not hasattr(self, 'tree'):
+            return
+        
+        # 檢查是否有任何標註
+        if not self.tree.get_children():
+            print("沒有檢測到現有標註，將從第一幀開始")
+            self._load_and_show_frame_by_number(0)
+            return
+        
+        # 從 TreeView 獲取所有標註的幀號
+        frame_indices = []
+        for item in self.tree.get_children():
+            try:
+                frame_idx = int(self.tree.item(item)["values"][0])
+                frame_indices.append(frame_idx)
+            except (IndexError, ValueError):
+                continue
+        
+        if not frame_indices:
+            print("無法從 TreeView 提取有效的幀號")
+            self._load_and_show_frame_by_number(0)
+            return
+        
+        # 找出最大的幀號，即當前分析進度
+        latest_frame = max(frame_indices)
+        
+        # 檢查是否已分析到最後一幀
+        if latest_frame >= self.total_frames - 1:
+            print(f"已完成所有幀的分析 (最後幀: {latest_frame})")
+            # 可以選擇跳到第一幀或最後一幀
+            self._load_and_show_frame_by_number(0)  # 跳到第一幀
+            return
+        
+        # 跳轉到最後一個標註的幀之後，準備繼續分析
+        next_frame = latest_frame + 1
+        print(f"檢測到分析進度，上次處理到幀 {latest_frame}，將跳轉到幀 {next_frame} 繼續分析")
+        
+        # 更新滑塊位置並載入該幀
+        self._update_slider_position(next_frame)
+        self._load_and_show_frame_by_number(next_frame)
+        
+        # 顯示提示訊息
+        self._update_status_bar(f"繼續從幀 {next_frame} 開始分析 (上次處理到幀 {latest_frame})")
+
+    # 4. 如果需要，添加一個輔助方法用於更新滑塊位置
+    def _update_slider_position(self, frame_idx):
+        """更新滑塊位置到指定幀"""
+        if hasattr(self, 'slider_var'):
+            self.slider_var.set(frame_idx)
+
+    # 新增處理 TreeView 選擇事件的方法
+    def _on_treeview_select(self, event=None):
+        """當用戶點擊 TreeView 中的項目時，跳轉到對應的幀"""
+        # 獲取當前選中的項目
+        selected_items = self.tree.selection()
+        if not selected_items:
+            return  # 沒有選中項目
+        
+        # 使用第一個選中的項目（通常只會選中一個）
+        selected_id = selected_items[0]
+        
+        try:
+            # 獲取幀號
+            frame_idx = int(self.tree.set(selected_id, "frame"))
+            
+            # 如果當前已經在該幀，則不需要重新載入
+            if frame_idx == self.current_frame_idx:
+                return
+            
+            # 記錄目前跳轉前的位置（方便稍後返回）
+            # self.previous_frame_idx = self.current_frame_idx
+            
+            # 跳轉到該幀
+            self._show_frame(frame_idx)
+            
+            # 更新狀態欄
+            self._update_status_bar(f"已跳轉到幀 {frame_idx}")
+            
+            # 可以在此處高亮顯示 ROI 區域或標記 OCR 文本位置
+            
+        except (ValueError, KeyError, TclError) as e:
+            print(f"跳轉到所選幀時出錯: {e}")
+            
+        # 確保 TreeView 保持焦點或選中狀態（避免選擇被清除）
+        self.tree.focus(selected_id)
+        self.tree.selection_set(selected_id)
+
+    # 在適當位置添加這些輔助方法
+
+    def _on_edit_annotation(self, event=None):
+        """打開編輯當前選中項目的標註內容的對話框，並將其定位在適當位置"""
+        try:
+            # 獲取選中的項目
+            selected_items = self.tree.selection()
+            if not selected_items:
+                print("沒有選中任何項目，無法編輯")
+                messagebox.showinfo("提示", "請先選擇要編輯的項目")
+                return
+                
+            selected_id = selected_items[0]
+            
+            # 獲取當前項目的值
+            try:
+                frame_idx = int(self.tree.item(selected_id)["values"][0])
+                current_response = self.tree.item(selected_id)["values"][1]
+                if not current_response:
+                    current_response = ""  # 確保是字串，避免 None 值
+                print(f"正在編輯幀 {frame_idx} 的標註，當前內容：{current_response}")
+            except (IndexError, ValueError) as e:
+                print(f"獲取項目值時出錯: {e}")
+                current_response = ""
+                try:
+                    frame_idx = int(self.tree.set(selected_id, "frame"))
+                    current_response = self.tree.set(selected_id, "response") or ""
+                    print(f"透過 set 方法獲取值：幀 {frame_idx}, 內容: {current_response}")
+                except Exception as e2:
+                    print(f"透過 set 方法獲取值也失敗: {e2}")
+                    messagebox.showerror("錯誤", f"無法獲取所選項目的內容: {e2}")
+                    return
+            
+            # 創建編輯對話框
+            edit_dialog = tk.Toplevel(self.master)
+            edit_dialog.title(f"編輯幀 {frame_idx} 的標註")
+            edit_dialog.geometry("400x150")  # 稍微縮小高度，因為通常只需要輸入簡短內容
+            edit_dialog.resizable(True, True)
+            
+            # 確保對話框在主窗口之上
+            edit_dialog.transient(self.master)
+            edit_dialog.grab_set()
+            
+            # 添加文本輸入框
+            lbl = tk.Label(edit_dialog, text=f"幀 {frame_idx} 的標註內容:")
+            lbl.pack(pady=(10, 5), padx=10, anchor="w")
+            
+            # 使用 Entry 而不是 Text（因為我們主要處理單行數字）
+            txt_var = tk.StringVar(value=current_response)
+            txt_edit = ttk.Entry(edit_dialog, textvariable=txt_var, width=20, font=("Arial", 12))
+            txt_edit.pack(fill=tk.X, expand=True, padx=10, pady=5)
+            
+            # 添加按鈕框架
+            btn_frame = tk.Frame(edit_dialog)
+            btn_frame.pack(fill=tk.X, padx=10, pady=10)
+            
+            # 定義保存函數
+            def save_edit():
+                try:
+                    new_text = txt_var.get().strip()
+                    print(f"保存編輯，新內容: {new_text}")
+                    
+                    # 更新 TreeView
+                    try:
+                        self.tree.item(selected_id, values=(frame_idx, new_text))
+                        print(f"成功更新 TreeView 項目")
+                    except Exception as e:
+                        print(f"更新 TreeView 項目失敗: {e}")
+                        # 備選方法
+                        try:
+                            self.tree.set(selected_id, "content", new_text)
+                            print(f"通過 set 方法更新 TreeView 成功")
+                        except Exception as e2:
+                            print(f"通過 set 方法更新 TreeView 也失敗: {e2}")
+                            raise
+                    
+                    # 同時更新記憶體中的標註
+                    self.annotations[frame_idx] = new_text
+                    print(f"已更新記憶體中的標註數據")
+                    
+                    # 標記已修改，需要保存
+                    self.changes_made = True
+                    
+                    # 關閉對話框
+                    edit_dialog.destroy()
+                    
+                    # 保持表格焦點，便於繼續用方向鍵導航
+                    self.tree.focus_set()
+                    
+                    # 可選：自動選擇下一項，方便連續編輯
+                    try:
+                        next_item = self._get_next_item(selected_id)
+                        if next_item:
+                            self.tree.selection_set(next_item)
+                            self.tree.see(next_item)  # 確保下一項可見
+                    except Exception as e:
+                        print(f"自動選擇下一項失敗: {e}")
+                        # 保持當前選擇
+                        self.tree.selection_set(selected_id)
+                    
+                except Exception as e:
+                    print(f"保存編輯時出錯: {e}")
+                    messagebox.showerror("錯誤", f"保存編輯時出錯: {e}")
+                    # 確保對話框關閉，避免卡住界面
+                    edit_dialog.destroy()
+            
+            # 綁定按鈕
+            btn_save = tk.Button(btn_frame, text="保存", command=save_edit)
+            btn_save.pack(side=tk.RIGHT, padx=5)
+            
+            # 取消按鈕
+            btn_cancel = tk.Button(btn_frame, text="取消", command=edit_dialog.destroy)
+            btn_cancel.pack(side=tk.RIGHT, padx=5)
+            
+            # 綁定 Enter 鍵到保存動作
+            txt_edit.bind("<Return>", lambda e: save_edit())
+            
+            # 設置焦點
+            txt_edit.focus_set()
+            # 游標定位到文字末尾
+            txt_edit.icursor(tk.END)
+            
+            # 將對話框定位到適當位置
+            if event and hasattr(event, 'x_root') and hasattr(event, 'y_root'):
+                # 如果有滑鼠事件，定位到滑鼠位置
+                x = event.x_root
+                y = event.y_root
+                
+                # 確保不會超出螢幕
+                dialog_width = 400
+                dialog_height = 150
+                screen_width = edit_dialog.winfo_screenwidth()
+                screen_height = edit_dialog.winfo_screenheight()
+                
+                # 調整 x 坐標，確保對話框不會超出右側螢幕邊緣
+                if x + dialog_width > screen_width:
+                    x = screen_width - dialog_width
+                
+                # 調整 y 坐標，確保對話框不會超出底部螢幕邊緣
+                if y + dialog_height > screen_height:
+                    y = screen_height - dialog_height
+                
+                edit_dialog.geometry(f"+{x}+{y}")
+            else:
+                # 如果是鍵盤事件或其他方式觸發，將對話框定位到表格項目附近
+                try:
+                    # 獲取當前選中項目的坐標
+                    item_id = selected_id
+                    tree_x, tree_y, _, _ = self.tree.bbox(item_id, "content")
+                    
+                    # 將對話框定位到項目右側
+                    abs_x = self.tree.winfo_rootx() + tree_x + 50  # 偏移一點，避免遮擋
+                    abs_y = self.tree.winfo_rooty() + tree_y
+                    
+                    edit_dialog.geometry(f"+{abs_x}+{abs_y}")
+                except Exception as e:
+                    print(f"定位對話框到項目位置失敗: {e}")
+                    # 使用默認位置 - TreeView 中心
+                    tree_x = self.tree.winfo_rootx() + self.tree.winfo_width() // 2
+                    tree_y = self.tree.winfo_rooty() + self.tree.winfo_height() // 2
+                    edit_dialog.geometry(f"+{tree_x-200}+{tree_y-75}")
+        
+        except Exception as e:
+            print(f"創建編輯對話框時發生未知錯誤: {e}")
+            messagebox.showerror("錯誤", f"編輯標註時發生錯誤: {e}")
+
+    # 在 TreeView 上添加右鍵選單功能
+    def _setup_treeview_context_menu(self):
+        """為 TreeView 設置右鍵選單"""
+        # 創建右鍵選單
+        self.treeview_menu = tk.Menu(self.tree, tearoff=0)
+        self.treeview_menu.add_command(label="編輯標註", command=self._on_edit_annotation)
+        self.treeview_menu.add_command(label="跳轉到此幀", command=lambda: self._on_treeview_select(None))
+        self.treeview_menu.add_separator()
+        self.treeview_menu.add_command(label="刪除標註", command=self._on_delete_annotation)
+        
+        # 綁定右鍵事件
+        self.tree.bind("<Button-3>", self._show_treeview_context_menu)
+        
+    def _show_treeview_context_menu(self, event):
+        """顯示 TreeView 的右鍵選單"""
+        # 獲取點擊位置對應的項目
+        item = self.tree.identify_row(event.y)
+        if item:
+            # 先選中點擊的項目
+            self.tree.selection_set(item)
+            # 在點擊位置顯示選單
+            self.treeview_menu.post(event.x_root, event.y_root)
+
+    def _on_delete_annotation(self):
+        """刪除當前選中的標註項目"""
+        selected_items = self.tree.selection()
+        if not selected_items:
+            return
+            
+        if messagebox.askyesno("確認", "確定要刪除所選標註嗎？這個操作無法撤銷。"):
+            for item_id in selected_items:
+                try:
+                    frame_idx = int(self.tree.set(item_id, "frame"))
+                    # 從標註字典中刪除
+                    if frame_idx in self.annotations:
+                        del self.annotations[frame_idx]
+                    # 從 TreeView 中刪除
+                    self.tree.delete(item_id)
+                    # 標記已修改
+                    self.changes_made = True
+                except (ValueError, KeyError, TclError) as e:
+                    print(f"刪除標註時出錯: {e}")
+            self._update_status_bar("已刪除所選標註")
+
+    # 添加一個新的綜合函數來載入所有現有數據
+    def _load_existing_data(self):
+        """載入當前視頻的所有現有數據，包括標註和變化幀列表"""
+        try:
+            print(f"正在載入現有數據: {self.video_title}")
+            
+            # 1. 確定數據目錄
+            video_name = self.video_file_path.stem
+            data_dir = Path("data") / video_name
+            self.dataset_dir = video_name  # 保存用於構建相對路徑
+            
+            if not data_dir.exists():
+                print(f"數據目錄不存在: {data_dir}，可能是新影片")
+                return
+                
+            # 2. 設置區域名稱和 ROI 名稱
+            self.region_name = getattr(self, "region_name", "region2")
+            self.roi_name = self.region_name  # 保持一致的命名
+            
+            # 3. 構建標註文件路徑
+            self.jsonl_file_path = data_dir / f"{self.region_name}.jsonl"
+            print(f"標註文件路徑: {self.jsonl_file_path} (存在: {self.jsonl_file_path.exists()})")
+            
+            # 4. 構建變化幀文件路徑
+            self.change_frames_path = data_dir / f"{self.region_name}_change.jsonl"
+            print(f"變化幀文件路徑: {self.change_frames_path} (存在: {self.change_frames_path.exists()})")
+            
+            # 5. 載入標註數據
+            if self.jsonl_file_path.exists():
+                self.annotations = self._load_annotations_from_jsonl(self.jsonl_file_path)
+                print(f"已載入 {len(self.annotations)} 個標註")
+                
+                # 將標註數據更新到表格
+                self._update_annotations_treeview()
+            else:
+                print(f"標註文件不存在: {self.jsonl_file_path}")
+                self.annotations = {}
+            
+            # 6. 載入變化幀列表
+            if self.change_frames_path.exists():
+                self.change_frames = self._load_change_frames(self.change_frames_path)
+                print(f"已載入 {len(self.change_frames)} 個變化幀")
+            else:
+                print(f"變化幀文件不存在: {self.change_frames_path}")
+                self.change_frames = set()
+                
+        except Exception as e:
+            print(f"載入現有數據時出錯: {e}")
+            traceback.print_exc()
+            messagebox.showwarning("警告", f"載入現有數據時發生錯誤，部分數據可能無法正確顯示: {e}")
+
+    # 更新將標註數據顯示到表格的方法
+    def _update_annotations_treeview(self):
+        """將標註數據更新到表格視圖"""
+        try:
+            # 清空現有表格內容
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            
+            # 按幀號排序顯示
+            for frame_idx, value in sorted(self.annotations.items()):
+                # 將標註添加到 TreeView
+                self.tree.insert("", tk.END, values=(frame_idx, value))
+                
+            # 更新狀態欄
+            self._update_status_bar(f"已載入 {len(self.annotations)} 個標註")
+            
+        except Exception as e:
+            print(f"更新標註表格時出錯: {e}")
+            traceback.print_exc()
+
+    # 添加載入變化幀列表的方法
+    def _load_change_frames(self, change_frames_path):
+        """從 JSONL 文件載入變化幀列表"""
+        change_frames = set()
+        try:
+            if not change_frames_path.exists():
+                return change_frames
+                
+            with open(change_frames_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        if 'frame' in data:
+                            change_frames.add(data['frame'])
+                    except json.JSONDecodeError:
+                        continue
+                        
+            print(f"從 {change_frames_path} 載入了 {len(change_frames)} 個變化幀")
+        except Exception as e:
+            print(f"載入變化幀列表時出錯: {e}")
+            traceback.print_exc()
+            
+        return change_frames
+
+    # 添加輔助方法：獲取下一個表格項目
+    def _get_next_item(self, current_item):
+        """獲取表格中的下一個項目"""
+        try:
+            # 獲取所有項目
+            all_items = self.tree.get_children()
+            if not all_items:
+                return None
+                
+            # 找到當前項目的索引
+            current_index = all_items.index(current_item)
+            
+            # 如果不是最後一項，返回下一項
+            if current_index < len(all_items) - 1:
+                return all_items[current_index + 1]
+            else:
+                # 如果是最後一項，返回第一項或 None
+                # return all_items[0]  # 循環到第一項
+                return None  # 保持在最後一項
+        except (ValueError, IndexError) as e:
+            print(f"獲取下一個項目時出錯: {e}")
+            return None
 
 if __name__ == "__main__":
     # Fix for potential blurry UI on high DPI Windows displays
