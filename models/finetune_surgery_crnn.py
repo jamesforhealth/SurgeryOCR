@@ -36,8 +36,8 @@ class FinetuneConfig:
     # 使用 PretrainConfig 中的模型保存路徑作為預訓練模型路徑的默認值
     pretrain_model_path = os.path.join(PretrainConfig.model_save_path, 'best_crnn_model.pth')
     surgery_data_dir = "../data/"  # 指向包含 JSONL 和圖像的目錄
-    surgery_jsonl_filename = "2024-11-20_h/region2/region2.jsonl" # JSONL 文件名
-    finetune_model_save_path = "./finetuned_models_surgery" # 微調後模型保存路徑 (可以改個名區分)
+    surgery_jsonl_filename = "2024-11-20_h/region2.jsonl" # JSONL 文件名
+    finetune_model_save_path = "./OCR_interface/simpleocr" # 微調後模型保存路徑 (可以改個名區分)
 
     # --- 新字符集 ---
     # 包含 0-9, 負號 '-', 空格 ' '

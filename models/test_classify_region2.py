@@ -138,7 +138,7 @@ def validate_epoch(model, dataloader, criterion, device):
 # -------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Region2 Image Classification by Digit Count")
-    parser.add_argument("--jsonl", type=str, default="region2/region2.jsonl", 
+    parser.add_argument("--jsonl", type=str, default="region2.jsonl", 
                         help="Path to the JSONL file (e.g., region2.jsonl)")
     parser.add_argument("--base-dir", type=str, default="", 
                         help="Base directory for image paths (leave empty if paths in JSONL are already complete)")

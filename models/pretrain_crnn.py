@@ -12,8 +12,11 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torch.nn import CTCLoss
 import json
+import random
+import argparse
 
 
+characters = '0123456789-'
 # 配置參數
 class PretrainConfig:
     # 數據路徑
@@ -41,8 +44,8 @@ class PretrainConfig:
     img_width = 128
     
     # 保存路徑
-    model_save_path = "./pretrained_models"
-    
+    model_save_path = "./OCR_interface/simpleocr"
+    pretrain_model_path = os.path.join(model_save_path, 'best_crnn_model.pth')
     # 設備
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -395,6 +398,12 @@ def run_pretraining():
     # 初始化模型、損失函數和優化器
     # --- 修改：傳遞正確的 num_classes ---
     model = CRNN(input_channels=config.input_channels, hidden_size=config.hidden_size, num_classes=config.num_classes).to(config.device)
+    if os.path.exists(config.pretrain_model_path):
+        model.load_state_dict(torch.load(config.pretrain_model_path))
+        print(f"已從 {config.pretrain_model_path} 加載預訓練模型")
+    else:
+        print(f"未找到預訓練模型 {config.pretrain_model_path}")
+    
     # --- 修改：設置 blank 索引 ---
     criterion = CTCLoss(blank=config.blank_index, reduction='mean', zero_infinity=True)
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -422,9 +431,8 @@ def run_pretraining():
         # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            model_save_file = os.path.join(config.model_save_path, "best_crnn_model.pth")
-            torch.save(model.state_dict(), model_save_file)
-            print(f"在 Epoch {epoch+1} 保存了新的最佳模型到 {model_save_file} (Val Loss: {val_loss:.4f})")
+            torch.save(model.state_dict(), config.pretrain_model_path)
+            print(f"在 Epoch {epoch+1} 保存了新的最佳模型到 {config.pretrain_model_path} (Val Loss: {val_loss:.4f})")
 
     print("\n訓練完成！")
 
@@ -452,6 +460,167 @@ def run_pretraining():
     print(f"訓練曲線圖已保存至: {plot_save_path}")
     # plt.show() # 如果在本地運行可以取消註釋
 
-# 主函數入口
+# --- 新增：單張圖片預處理函數 ---
+def preprocess_single_image(image_path, img_height, img_width, device):
+    transform = transforms.Compose([
+        transforms.Resize((img_height, img_width)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5]) # 歸一化到 [-1, 1]
+    ])
+    try:
+        image = Image.open(image_path).convert('L') # 確保是灰度圖
+    except FileNotFoundError:
+        print(f"錯誤: 測試圖片 {image_path} 未找到。")
+        raise
+    except Exception as e:
+        print(f"錯誤: 打開或轉換圖片 {image_path} 時出錯: {e}")
+        raise
+        
+    image = transform(image)
+    image = image.unsqueeze(0) # 添加 batch 維度 [C, H, W] -> [B, C, H, W]
+    return image.to(device)
+
+# --- 新增：單張圖片測試函數 ---
+def test_single_image(model_path_to_test, char_map_path_to_test, image_path_to_test, base_config):
+    """
+    使用指定的CRNN模型測試單張圖片。
+    base_config: 用於獲取如 img_height, img_width, device, input_channels, hidden_size 等基礎模型結構參數
+    """
+    device = torch.device(base_config.device)
+    print(f"\n--- 開始單張圖片測試 ---")
+    print(f"模型權重: {model_path_to_test}")
+    print(f"字符映射: {char_map_path_to_test}")
+    print(f"測試圖片: {image_path_to_test}")
+
+    # 1. 加載字符映射表
+    try:
+        with open(char_map_path_to_test, 'r', encoding='utf-8') as f:
+            # JSON 加載後 key 是字符串，需要轉為整型
+            loaded_idx_to_char_str_keys = json.load(f) 
+            loaded_idx_to_char = {int(k): v for k, v in loaded_idx_to_char_str_keys.items()}
+        print(f"字符映射表已從 {char_map_path_to_test} 加載。包含 {len(loaded_idx_to_char)} 個字符。")
+    except FileNotFoundError:
+        print(f"錯誤: 字符映射文件 {char_map_path_to_test} 未找到。")
+        return
+    except Exception as e:
+        print(f"錯誤: 加載或解析字符映射表 {char_map_path_to_test} 時出錯: {e}")
+        return
+
+    # 2. 根據加載的字符映射表確定模型參數
+    num_chars_from_map = len(loaded_idx_to_char)
+    num_model_classes_for_test = num_chars_from_map + 1  # 字符數 + CTC空白
+    blank_idx_for_decode = num_chars_from_map          # CTC空白索引為 M
+
+    print(f"  推斷模型類別數: {num_model_classes_for_test}")
+    print(f"  推斷CTC空白索引: {blank_idx_for_decode}")
+
+    # 3. 初始化模型
+    # 使用 base_config 中的結構參數，但 num_classes 來自加載的映射表
+    try:
+        model_to_test = CRNN(input_channels=base_config.input_channels,
+                             hidden_size=base_config.hidden_size,
+                             num_classes=num_model_classes_for_test).to(device)
+    except Exception as e:
+        print(f"錯誤: 初始化CRNN模型時出錯 (請檢查 base_config 中的 input_channels/hidden_size 是否與模型兼容): {e}")
+        return
+
+    # 4. 加載模型權重
+    if not os.path.exists(model_path_to_test):
+        print(f"錯誤: 模型權重文件 {model_path_to_test} 未找到。")
+        return
+    try:
+        model_to_test.load_state_dict(torch.load(model_path_to_test, map_location=device))
+        model_to_test.eval()
+        print(f"模型權重已從 {model_path_to_test} 加載。")
+    except Exception as e:
+        print(f"錯誤: 加載模型權重 {model_path_to_test} 時出錯: {e}")
+        print(f"  這通常意味著模型架構 (input_channels, hidden_size, num_classes) 與權重文件不匹配。")
+        print(f"  期望 num_classes={num_model_classes_for_test} (基於字符映射表)。")
+        return
+
+    # 5. 預處理圖片
+    try:
+        img_tensor = preprocess_single_image(image_path_to_test, 
+                                            base_config.img_height, 
+                                            base_config.img_width, 
+                                            device)
+    except Exception as e:
+        # preprocess_single_image 內部已打印錯誤，此處直接返回
+        return
+
+    # 6. 模型推理和解碼
+    try:
+        with torch.no_grad():
+            preds_tensor = model_to_test(img_tensor) # Output: [T, B, C]
+        
+        # 使用加載的 idx_to_char 和推斷的 blank_idx 進行解碼
+        decoded_texts = decode_predictions(preds_tensor.cpu(), loaded_idx_to_char, blank_idx_for_decode)
+        
+        if decoded_texts:
+            print(f"\n識別結果: \"{decoded_texts[0]}\"")
+        else:
+            print("識別結果為空。")
+            
+    except Exception as e:
+        print(f"錯誤: 模型推理或解碼時出錯: {e}")
+
+# --- 主函數入口 ---
 if __name__ == "__main__":
-    run_pretraining() 
+    # 設置隨機種子以保證可複現性 (如果需要)
+    # seed = 42
+    # random.seed(seed)
+    # np.random.seed(seed)
+    # torch.manual_seed(seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(seed)
+
+    parser = argparse.ArgumentParser(description="CRNN 預訓練與測試腳本")
+    parser.add_argument("--run_mode", type=str, default="train", choices=["train", "test"],
+                        help="運行模式: 'train' 進行訓練, 'test' 進行單圖測試。 (默認: train)")
+    
+    # 測試模式參數
+    parser.add_argument("--test_image_path", type=str, default=None,
+                        help="[測試模式] 要進行OCR測試的單張圖片路徑。")
+    parser.add_argument("--test_model_path", type=str, default='OCR_interface/simpleocr/best_crnn_model.pth',
+                        help="[測試模式] 用於測試的CRNN模型權重文件 (.pth) 路徑。")
+    parser.add_argument("--test_char_map_path", type=str, default='OCR_interface/simpleocr/char_mapping.json',
+                        help="[測試模式] 用於測試的字符映射表 (char_mapping.json) 路徑。")
+    
+    # 可以添加更多參數來覆蓋 PretrainConfig 中的默認值，例如：
+    # parser.add_argument("--characters", type=str, help="覆蓋訓練時的字符集")
+    # parser.add_argument("--epochs", type=int, help="覆蓋訓練的 epoch 數量")
+
+    args = parser.parse_args()
+    
+    config = PretrainConfig() # 加載默認配置
+
+    # 如果需要，可以在這裡用 args 中的值更新 config 對象的屬性
+    # if args.characters: config.characters = args.characters (需要重新計算依賴項)
+    # if args.epochs: config.epochs = args.epochs
+
+    if args.run_mode == "test":
+        print("進入測試模式...")
+        if not all([args.test_image_path]):
+            parser.error("[測試模式] 必須提供 --test_image_path參數。")
+        else:
+            test_single_image(
+                model_path_to_test=args.test_model_path,
+                char_map_path_to_test=args.test_char_map_path,
+                image_path_to_test=args.test_image_path,
+                base_config=config # 傳遞基礎配置以獲取模型結構參數
+            )
+    elif args.run_mode == "train":
+        print("進入訓練模式...")
+        # 在開始訓練前，重新基於 (可能已更新的) config.characters 初始化依賴項
+        config.char_to_int = {char: i for i, char in enumerate(config.characters)}
+        config.char_to_idx = {char: i for i, char in enumerate(config.characters)}
+        config.idx_to_char = {i: char for i, char in enumerate(config.characters)}
+        config.num_classes = len(config.characters) + 1
+        config.blank_index = len(config.characters)
+        config.char_map_save_path = os.path.join(config.model_save_path, f"pretrain_char_mapping_{''.join(filter(str.isalnum, config.characters))}.json") # 根據字符集命名
+        config.pretrain_model_path = os.path.join(config.model_save_path, f"best_pretrain_crnn_model_{''.join(filter(str.isalnum, config.characters))}.pth")
+
+
+        run_pretraining()
+    else:
+        print(f"錯誤: 未知的運行模式 '{args.run_mode}'")
