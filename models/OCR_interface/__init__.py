@@ -24,7 +24,7 @@ PRETRAINED_MODELS = {
     "crnn_fine_tuned": "models/OCR_interface/simpleocr/best_finetuned_model.pth",
 }
 
-def get_ocr_model(model_type="easyocr", pretrained=None, **kwargs):
+def get_ocr_model(model_type="easyocr", pretrained=None, debug_output=True, **kwargs):
     """
     獲取OCR模型實例
     
@@ -32,12 +32,15 @@ def get_ocr_model(model_type="easyocr", pretrained=None, **kwargs):
         model_type: 模型類型，支持 'easyocr' 或 'crnn'
         pretrained: 使用預訓練模型名稱，例如 'default' 或 'fine_tuned'，
                    如果指定，將忽略model_path參數
+        debug_output: 是否在終端輸出詳細的調試信息
         **kwargs: 傳遞給模型初始化函數的參數
     
     返回:
         OCR模型實例
     """
     if model_type.lower() == "easyocr":
+        # 將debug_output參數傳遞給EasyOCRModel
+        kwargs['debug_output'] = debug_output
         return EasyOCRModel(**kwargs)
     
     elif model_type.lower() == "crnn":
