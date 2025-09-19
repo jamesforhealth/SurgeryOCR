@@ -1,0 +1,16 @@
+{
+  "PEDAL": {
+    "analysis_mode": "sub_roi",
+    "sub_roi_coords": [20, 13, 26, 19],
+    "diff": "rmse",
+    "diff_threshold": 40.0,
+    "cache_hit_threshold": 50.0,
+    "description": "PEDAL區域精細分析範圍，diff_threshold用於前後幀比較，cache_hit_threshold用於cache匹配"
+  },
+  "STAGE": {
+    "analysis_mode": "full_roi",
+    "diff": "rmse",
+    "diff_threshold": 15.0,
+    "description": "STAGE區域使用完整ROI"
+  }
+}

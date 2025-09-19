@@ -12,8 +12,14 @@ venv/
 env/
 ENV/
 
-# --- 忽略所有資料夾內層內的png---
+# --- 忽略測試用檔案
+test_*
+finetune_surgery_crnn.py
+
+# --- 忽略所有資料夾內層內的png（除了 roi_img_caches）---
 **/*.png
+# 保留 roi_img_caches 中的 PNG 文件
+!data/roi_img_caches/**/*.png
 **/*.gz
 **/*.mat
 **/*.mp4
@@ -24,4 +30,15 @@ ENV/
 *.bin
 *.zip
 *.mp4
+*.txt
 # --- 忽略某些可能過大的檔案或資料夾 ---
+# 忽略 data 目錄下的所有內容，但保留 data 目錄本身
+data/*
+# 保留 .gitkeep 文件以確保目錄被 Git 追踪
+!data/.gitkeep
+# 保留 roi_img_caches 目錄及其所有內容（包括圖片）
+!data/roi_img_caches/
+!data/roi_img_caches/**
+
+components/
+#

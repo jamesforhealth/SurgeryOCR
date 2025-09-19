@@ -16,7 +16,14 @@ This project aims to automate the extraction and labeling of critical numerical 
 
 * **Video Analysis:** Processes ophthalmological surgery videos as input.
 * **On-Screen OCR:** Employs OCR to recognize numerical data displayed on the video frames.
-* **Stage Identification:** (Optional, but good to mention if planned) Aims to identify different stages of the surgery to provide context to the extracted data.
-* **Data Labeling:** Labels the extracted numerical data according to the identified surgical stage (if stage identification is implemented).
+* **Stage Identification:** Aims to identify different stages of the surgery to provide context to the extracted data.
+* **Data Labeling:** Labels the extracted numerical data according to the identified surgical stage
 * **Output:** Generates structured output (e.g., CSV, JSON) containing the extracted numerical data and their corresponding labels and timestamps.
 
+## Usage
+
+1. Put all surgery videos .mp4 files into "./data" directory
+2. Run "python extract_roi_images.py"
+3. Run "python surgery_analysis_process.py"
+4. Run "python stage_pattern_analysis.py"
+5. See all analysis results by the UI app, run "python video_annotator_gui.py"

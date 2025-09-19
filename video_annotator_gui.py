@@ -1,29 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Enhanced Video Annotation GUI
-- 使用 T-MAD 進行幀間變化偵測
-- 分離變化偵測與OCR兩條背景線程
-- 定點ROI OCR，連續無變化則複製上一幀結果
-- 動態放大影片視窗 (800x450)
-- 右側 TreeView 可雙向滾動+垂直 Slider 快速跳轉
-- 可編輯、儲存(為JSONL)表格；中途結果與ROI圖自動保存
 
-已修正：
-- 每個執行緒使用獨立 VideoCapture，避免 libavcodec async_lock 錯誤
-- slider 僅在拖動釋放時讀取幀，提高 UI 流暢度
-"""
 from __future__ import annotations
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-import threading
 import queue
-from typing import Optional
+from typing import Optional, Any
 import json
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional
 import time
+import numpy as np
+from dataclasses import dataclass # 新增
 
 import cv2
 from PIL import Image, ImageTk, ImageDraw
@@ -32,99 +21,38 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import matplotlib
 import tkinter.font as tkFont # For bold font in Treeview
 from tkinter import TclError
-import csv
-import easyocr
 import torch
-import shutil
-import tempfile
 import traceback
-from skimage import exposure, filters, morphology
 from models.OCR_interface import get_ocr_model
-from components.test_binary_frame_change import add_test_button
 from typing import List, Tuple
-# --------------- 變化偵測接口 (僅 T-MAD) ---------------
-class ChangeDetectorInterface:
-    def __init__(self):
-        print("變化偵測接口初始化 (使用 T-MAD)。")
-        pass
+import colorsys
+from sklearn.cluster import KMeans
+from PIL import ImageColor
 
-    def _calculate_tmad(self, img1_pil: Image.Image, img2_pil: Image.Image, diff_threshold: int) -> float:
-        """計算兩個 PIL 圖像之間的 T-MAD"""
-        try:
-            # 轉換為灰度 NumPy 數組
-            img1_gray = cv2.cvtColor(np.array(img1_pil), cv2.COLOR_RGB2GRAY)
-            img2_gray = cv2.cvtColor(np.array(img2_pil), cv2.COLOR_RGB2GRAY)
-
-            # 確保圖像大小相同
-            if img1_gray.shape != img2_gray.shape:
-                h1, w1 = img1_gray.shape
-                h2, w2 = img2_gray.shape
-                # 嘗試將第二個圖像調整為第一個的大小
-                print(f"警告：T-MAD 計算時圖像大小不匹配 ({h1}x{w1} vs {h2}x{w2})，嘗試調整大小...")
-                img2_gray = cv2.resize(img2_gray, (w1, h1), interpolation=cv2.INTER_AREA)
-
-            # 計算絕對差值
-            diff = cv2.absdiff(img1_gray, img2_gray)
-
-            # 應用閾值 (忽略小於等於閾值的差異)
-            diff_thresholded = diff.copy()
-            diff_thresholded[diff_thresholded <= diff_threshold] = 0
-
-            # 計算閾值化後的平均絕對差
-            t_mad = np.mean(diff_thresholded)
-            return t_mad
-        except Exception as e:
-            print(f"錯誤：計算 T-MAD 時出錯: {e}")
-            return float('inf') # 返回極大值表示錯誤
-
-    def is_changed(self, prev: Image.Image, curr: Image.Image,
-                   tmad_threshold: float = 3.0, diff_threshold: int = 30) -> bool:
-        """
-        使用 T-MAD 判斷兩個圖像之間是否發生變化。
-
-        Args:
-            prev: 上一幀的 PIL 圖像 (ROI)。
-            curr: 當前幀的 PIL 圖像 (ROI)。
-            tmad_threshold: T-MAD 方法的分類閾值。
-            diff_threshold: T-MAD 方法中忽略的像素差異閾值。
-
-        Returns:
-            如果檢測到變化 (T-MAD >= tmad_threshold) 則返回 True，否則返回 False。
-        """
-        t_mad = self._calculate_tmad(prev, curr, diff_threshold)
-        # print(f"  T-MAD: {t_mad:.4f} (Threshold: {tmad_threshold})") # Debugging
-        return t_mad >= tmad_threshold
-
-class EasyOCRInterface:
-    """
-    精簡版 EasyOCR：只辨識 0–9 和 '.'；任何錯誤皆回傳空字串。
-    """
-    def __init__(self, use_gpu: bool = False):
-        print("初始化 EasyOCR...")
-        try:
-            self.reader = easyocr.Reader(['en'], gpu=use_gpu)
-        except Exception as e:
-            print(f"GPU 初始化失敗，改用 CPU: {e}")
-            self.reader = easyocr.Reader(['en'], gpu=False)
-
-    def predict(self, pil_img: Image.Image) -> str:
-        if pil_img is None:
-            return ""
-        try:
-            res = self.reader.readtext(
-                np.array(pil_img),
-                allowlist="0123456789-",
-                detail=0,
-                paragraph=False
-            )
-            return res[0].strip() if res else ""
-        except Exception as e:
-            print(f"OCR 失敗: {e}")
-            return ""
+# 新增：從 utils 導入 diff rule 載入器
+from utils.get_configs import load_diff_rules, load_roi_config, load_roi_header_config
 
 
-"""回傳 data/config/rois.json 路徑"""
-get_roi_config_path = lambda : Path("data") / "config" / "rois.json"
+"""回傳 config/rois.json 路徑"""
+get_roi_config_path = lambda : Path("config") / "rois.json"
+
+"""回傳 config/surgery_stage_rois.json 路徑"""
+get_surgery_stage_roi_config_path = lambda : Path("config") / "surgery_stage_rois.json"
+
+# 新增：定義 RegionPattern 資料結構，與分析腳本一致
+@dataclass
+class RegionPattern:
+    pattern_id: int
+    array: np.ndarray
+
+
+frame_width = 80
+content_width = 120
+end_frame_width = 80
+iop_width = 80
+asp_width = 120
+vac_width = 120
+
 # -------------------- 主GUI --------------------
 class VideoAnnotator(tk.Frame):
     VID_W, VID_H = 800, 450
@@ -133,53 +61,113 @@ class VideoAnnotator(tk.Frame):
 
     def __init__(self, master: tk.Tk):
         super().__init__(master)
-        master.title("Frame Annotation Tool (T-MAD Change Detection)")
-        master.geometry("1350x750")
-        master.protocol("WM_DELETE_WINDOW", self._on_closing)
-        self.pack(fill="both", expand=True)
-
-        self.cap_ui: Optional[cv2.VideoCapture] = None
-        self.total_frames = 0
-        self.video_file_path: Optional[Path] = None
-        self.video_title: str = ""
-        self.current_frame_idx = 0
-        self.roi_coords: Optional[tuple] = None
-        self.original_vid_w = 0
-        self.original_vid_h = 0
-        self.roi_start_coords: Optional[tuple] = None
-
-        # OCR 測試視窗相關屬性
-        self.ocr_test_active = False
-        self.ocr_test_window = None
-
-        self.region_name = "region2"
-        self.roi_dict: Dict[str, list] = {
-            "region2": [1640, 445, 1836, 525],
-        }
-        self._load_roi_config()  # 先載入配置
+        self.master = master
         
-        # 設定預設region（從已載入的配置中選擇，或使用第一個可用的）
-        if self.roi_dict:
-            self.region_name = list(self.roi_dict.keys())[0]  # 使用第一個可用區域
-        else:
-            # 如果沒有配置檔案，建立一個預設的 region2
-            self.region_name = "region2"
-            self.roi_dict[self.region_name] = [1640, 445, 1836, 525]
-                    
-        self.change_cache: Dict[int, bool] = {}
-        self.ocr_cache: Dict[int, str] = {}
-        self.annotations: Dict[int, str] = {}
-        self.roi_image_cache: Dict[int, Image.Image] = {}
+        self.master.title("Frame Annotation Tool")
+        self.master.geometry("1350x750")
+        self.master.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self.pack(fill="both", expand=True)
+        
+        self.video_file_path: Optional[Path] = None
+        self.video_title = ""
+        self.cap_ui: Optional[cv2.VideoCapture] = None
+        self.cap_worker: Optional[cv2.VideoCapture] = None
+        
+        self.total_frames = 0
+        self.fps = 30
+        self.current_frame_idx = 0
+        self.playback_active = False
+        
+        # 資料模型
+        self.annotations = {}
+        self.change_cache = {}  # Stores {frame_idx: bool}
+        self.roi_coords = None
+        
+        # OCR數據緩存，用於性能優化
+        self.ocr_cache = {}  # {region_name: {frame: ocr_text}}
+        
+        # 控制表格同步的標誌
+        self._user_clicked_treeview = False  # 用戶是否手動點擊了表格
+        self.sub_roi_coords = None
+        self.region_name = ""
+        self.roi_dict = {}
 
-        self.current_analysis_cache: Dict[int, str] = {}
+        # 手術階段ROI相關變量
+        self.surgery_stage_roi_dict = {}  # 手術階段ROI配置
+        self.surgery_stage_mode = False   # 是否在手術階段ROI模式
+        self.current_surgery_stage_region = ""  # 當前選中的手術階段區域
+
+        # 手術階段ROI座標變量
+        self.surgery_stage_x1_var = tk.IntVar(value=0)
+        self.surgery_stage_y1_var = tk.IntVar(value=0)
+        self.surgery_stage_x2_var = tk.IntVar(value=0)
+        self.surgery_stage_y2_var = tk.IntVar(value=0)
+
+        # 手術階段ROI預覽相關變量
+        self.stage_roi_preview_label = None
+        self.stage_roi_preview_image = None
+        self.stage_roi_preview_size = (150, 50)  # 預覽區域大小
+        self.roi_diff_label = None
+        self.sub_roi_rect_id = None # 用於在canvas上繪製sub ROI框
+        self.diff_table = None # 用於顯示差異表格
+        # 新增：用Canvas顯示RMSE矩陣
+        self.diff_canvas = None
+        
+        # 階段分析與時間軸標籤（Stage Tags）
+        self.stage_analysis = None  # 讀取 data/<video>/stage_analysis.json 後的資料
+        
+        # 同步控制變數
+        self._sync_in_progress = False
+        self._is_arrow_key_navigation = False
+        self.stage_tag_panel = None
+        self.stage_tag_canvas = None  # 將被替換為多軌道系統
+        self.stage_tag_controls_frame = None
+        self.stage_tag_meta = {}  # canvas_item_id -> {region, pattern, start, end, avg_rmse}
+        self.stage_tag_roi_vars = {}  # region -> tk.BooleanVar
+        self.stage_tag_visible = tk.BooleanVar(value=True)
+        self.stage_tracks_mode = 'tags'  # 保留擴展
+        
+        # 多軌道時間軸系統
+        self.timeline_tracks = {}  # region_name -> {'canvas': canvas, 'meta': {}, 'frame': frame}
+        self.timeline_container = None
+        self.timeline_main_canvas = None
+        self.timeline_tracks_frame = None
+        self.timeline_v_scrollbar = None
+        self.track_height = 22  # 每個軌道的高度
+        self.track_spacing = 4   # 軌道間距
+        self.show_alignment_grid = False  # 是否顯示對齊網格（測試用）
+        self.roi_color_map = {
+            'PEDAL': '#007bff', # A modern, vibrant blue
+            'STAGE': '#28a745', # A clear, distinct green
+        }
+        
+        # 色彩生成方案 (HSV)
+        self.color_variation_params = {
+            'PEDAL': {'h_shift': 0.02, 's_factor': 0.9, 'v_factor': 0.85},
+            'STAGE': {'h_shift': 0.03, 's_factor': 0.95, 'v_factor': 0.9},
+        }
+        
+        # ROI圖像快取系統
+        self.roi_image_cache = {}  # {region_name: cached_image_array}
+        diff_rules = load_diff_rules()
+        region_config = diff_rules.get(self.region_name, {})         
+        self.cache_hit_threshold = region_config.get("diff_threshold", 60.0)  # RMSE閾值，低於此值認為是cache hit
+        # 各階段區域上一幀 ROI 快取
+        self.previous_stage_roi_images = {}
+
+        self.ocr_iface = None
+        self.ocr_test_window = None
+        self.ocr_test_active = False
+
+        # 手術階段ROI進階分析窗口
+        self.surgery_stage_roi_test_window = None
+        self.surgery_stage_roi_test_active = False
+
+        # 狀態標誌
+        self.status_var = tk.StringVar(value="就緒")
 
         self.hsv_s_threshold_var = tk.IntVar(value=30)
         self.gray_threshold_var = tk.IntVar(value=150)
-
-        # result_queue 仍然需要，用於從背景執行緒向UI傳遞結果和進度
-        self.result_queue = queue.Queue()
-        self.stop_event = threading.Event()
-        self.save_lock = threading.Lock()
 
         self.ocr_iface = get_ocr_model(
             model_type="easyocr",
@@ -188,44 +176,38 @@ class VideoAnnotator(tk.Frame):
             confidence_threshold=self.OCR_CONF_TH,
             debug_output=True  # 啟用詳細調試輸出
         )
-        self.change_iface = ChangeDetectorInterface()
 
-        self.tmad_threshold_var = tk.DoubleVar(value=2.0)
-        self.diff_threshold_var = tk.IntVar(value=30)
 
         self.roi_x1_var = tk.IntVar(value=0)
         self.roi_y1_var = tk.IntVar(value=0)
         self.roi_x2_var = tk.IntVar(value=0)
         self.roi_y2_var = tk.IntVar(value=0)
         
-        self.status_var = tk.StringVar(value="就緒")
-
         self._create_widgets()
-        self._load_ocr_models()
 
-        self.analysis_thread: Optional[threading.Thread] = None
-        # self.ocr_thread is removed
+        # 預加載手術階段ROI配置
+        self._load_surgery_stage_roi_config()
+
+        # 預加載OCR ROI配置
+        self._load_roi_config()
 
         master.bind("<Left>", self._on_left_key)
         master.bind("<Right>", self._on_right_key)
         master.bind("<Up>", self._on_up_key)
         master.bind("<Down>", self._on_down_key)
         master.bind("<space>", self._toggle_ocr_test_window)
-        
-        # self.status_var = tk.StringVar(value="就緒") # Moved this line up
-        # lbl_status pack in _create_widgets
-        
-        self.changes_made = False
 
     def _on_left_key(self, event=None):
         """處理左鍵事件 - 前一幀"""
         print("左鍵按下 - 前一幀")
+        self._is_arrow_key_navigation = True
         self._step_frame(-1)
         return "break"  # 阻止事件繼續傳播
 
     def _on_right_key(self, event=None):
         """處理右鍵事件 - 後一幀"""
         print("右鍵按下 - 後一幀")
+        self._is_arrow_key_navigation = True
         self._step_frame(+1)
         return "break"  # 阻止事件繼續傳播
 
@@ -340,202 +322,235 @@ class VideoAnnotator(tk.Frame):
         matplotlib.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS']
         matplotlib.rcParams['axes.unicode_minus'] = False
         
-        top_frame_config = tk.Frame(self)
-        top_frame_config.pack(pady=5, padx=10, fill="x")
-
-        self.lbl_video_path = tk.Label(top_frame_config, text="未選擇影片")
-        self.lbl_video_path.pack(side="left", padx=5)
-
-        tk.Label(top_frame_config, text="OCR模型:").pack(side="left", padx=(10, 2))
-        self.ocr_model_var = tk.StringVar(self)
-        self.ocr_model_combobox = ttk.Combobox(top_frame_config, textvariable=self.ocr_model_var,
-                                               values=[], state="readonly", width=15)
-        self.ocr_model_combobox.pack(side="left", padx=2)
-        self.ocr_model_combobox.bind("<<ComboboxSelected>>", self._on_ocr_model_change)
-
-        tk.Label(top_frame_config, text="區域:").pack(side="left", padx=(10,2))
-        self.region_var = tk.StringVar()
-        self.region_combobox = ttk.Combobox(top_frame_config, textvariable=self.region_var,
-                                            state="readonly", width=10)
-        self.region_combobox.pack(side="left")
-        self.region_combobox.bind("<<ComboboxSelected>>", self._on_region_select)
-
-        btn_new_region = tk.Button(top_frame_config, text="新增區域", command=self._on_add_region)
-        btn_new_region.pack(side="left", padx=2)
-
-        btn_save_roi_config = tk.Button(top_frame_config, text="儲存ROI組態", command=self._save_roi_config)
-        btn_save_roi_config.pack(side="left", padx=2)
-
-        roi_field = tk.Frame(top_frame_config)
-        roi_field.pack(side="left", padx=(10, 0))
-        for text, var_tuple in [("x1", self.roi_x1_var),
-                                ("y1", self.roi_y1_var),
-                                ("x2", self.roi_x2_var),
-                                ("y2", self.roi_y2_var)]:
-            tk.Label(roi_field, text=f"{text}:").pack(side="left")
-            ttk.Spinbox(roi_field, from_=0, to=99999, width=6,
-                        textvariable=var_tuple).pack(side="left") # Fixed: var_tuple instead of var
-        tk.Button(roi_field, text="套用", command=self._apply_roi_from_fields)\
-          .pack(side="left", padx=3)
-
-        tmad_frame = tk.Frame(top_frame_config)
-        tmad_frame.pack(side="left", padx=(10, 0)) 
-
-        ttk.Label(tmad_frame, text="T-MAD 門檻:").pack(side="left", padx=(0, 2))
-        self.tmad_threshold_spinbox = ttk.Spinbox(tmad_frame, from_=0.0, to=100.0, increment=0.1, width=5, textvariable=self.tmad_threshold_var)
-        self.tmad_threshold_spinbox.pack(side="left", padx=(0, 5))
-
-        ttk.Label(tmad_frame, text="忽略差異<=").pack(side="left", padx=(5, 2))
-        self.diff_threshold_spinbox = ttk.Spinbox(tmad_frame, from_=0, to=255, increment=1, width=4, textvariable=self.diff_threshold_var)
-        self.diff_threshold_spinbox.pack(side="left", padx=(0, 5))
-
-        main_action_buttons_frame = tk.Frame(self)
-        main_action_buttons_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-
-        # 載入影片按鈕 (移到 main_action_buttons_frame)
-        self.btn_load = tk.Button(main_action_buttons_frame, text="載入影片", command=self._load_video)
-        self.btn_load.pack(side=tk.LEFT, padx=5)
-        
-        # self.btn_test = add_test_button(top_frame_config, self)
-        # self.btn_test.pack(side="left", padx=5)
+        # 初始化變數（需要在UI創建前）
         self.binarize_mode_var = tk.BooleanVar(value=False)
         self.binarize_method_var = tk.StringVar(value="rule")
-
-        binarize_frame = tk.Frame(self)
-        binarize_frame.pack(fill="x", padx=10, pady=5)
-
-        tk.Checkbutton(binarize_frame, text="二值化顯示", variable=self.binarize_mode_var, command=self._on_binarize_toggle).pack(side="left")
-        tk.Radiobutton(binarize_frame, text="OTSU", variable=self.binarize_method_var, value="otsu", command=self._on_binarize_method_change).pack(side="left")
-        tk.Radiobutton(binarize_frame, text="K-means", variable=self.binarize_method_var, value="kmeans", command=self._on_binarize_method_change).pack(side="left")
-        tk.Radiobutton(binarize_frame, text="規則分割", variable=self.binarize_method_var, value="rule", command=self._on_binarize_method_change).pack(side="left")
-
-        # 規則分割參數（HSV S閾值、灰階閾值）
-        tk.Label(binarize_frame, text="S閾值:").pack(side="left")
-        ttk.Spinbox(binarize_frame, from_=0, to=255, width=4, textvariable=self.hsv_s_threshold_var, command=self._on_binarize_method_change).pack(side="left")
-        tk.Label(binarize_frame, text="灰階閾值:").pack(side="left")
-        ttk.Spinbox(binarize_frame, from_=0, to=255, width=4, textvariable=self.gray_threshold_var, command=self._on_binarize_method_change).pack(side="left")
-
-        self.lbl_diff = tk.Label(binarize_frame, text="Diff: -")
-        self.lbl_diff.pack(side="left", padx=10)
-        self.lbl_change = tk.Label(binarize_frame, text="變化判定: -")
-        self.lbl_change.pack(side="left", padx=10)
-
-
-        self.btn_analyze = tk.Button(
-            main_action_buttons_frame, 
-            text="開始分析", 
-            command=self._start_analysis,
-            state=tk.DISABLED
-        )
-        self.btn_analyze.pack(side=tk.LEFT, padx=5)
         
-        self.btn_stop = tk.Button(
-            main_action_buttons_frame, 
-            text="停止分析", 
-            command=self._stop_analysis,
-            state=tk.DISABLED
-        )
-        self.btn_stop.pack(side=tk.LEFT, padx=5)
+        # ========================= HEADER 區域 =========================
+        header_frame = tk.Frame(self, relief="groove", bd=2)
+        header_frame.pack(fill="x", padx=5, pady=5)
         
-        self.btn_save = tk.Button(
-            main_action_buttons_frame, 
-            text="儲存標註", 
-            command=lambda: self._save_annotations(self.region_name)
-        )
-        self.btn_save.pack(side=tk.LEFT, padx=5)
+        # Header 左半邊：設定和控制 (固定寬度50%)
+        header_left = tk.Frame(header_frame)
+        header_left.pack(side="left", fill="both", expand=True, padx=(5, 2), pady=5)
+        
+        # 影片路徑和基礎控制
+        video_control_frame = tk.Frame(header_left)
+        video_control_frame.pack(fill="x", pady=(0, 5))
+        
+        self.btn_load = tk.Button(video_control_frame, text="載入影片", command=self._load_video)
+        self.btn_load.pack(side="left", padx=(0, 10))
+        
+        self.lbl_video_path = tk.Label(video_control_frame, text="未選擇影片")
+        self.lbl_video_path.pack(side="left", padx=5)
+        
+        # OCR模式專用控制項（會根據模式動態顯示/隱藏）
+        self.binarize_checkbox = tk.Checkbutton(video_control_frame, text="二值化顯示", variable=self.binarize_mode_var, command=self._on_binarize_toggle)
+        self.binarize_checkbox.pack(side="right", padx=5)
+        
+        self.btn_save = tk.Button(video_control_frame, text="儲存標註", command=lambda: self._save_annotations(self.region_name))
+        self.btn_save.pack(side="right", padx=(0, 10))
+        
+        # 模式選擇標籤頁
+        self.mode_notebook = ttk.Notebook(header_left)
+        self.mode_notebook.pack(fill="x", pady=(0, 3))
+        
+        # OCR 模式標籤頁
+        self.ocr_mode_frame = ttk.Frame(self.mode_notebook)
+        self.mode_notebook.add(self.ocr_mode_frame, text="OCR 標註模式")
+        
+        # OCR ROI 設定
+        ocr_roi_frame = tk.LabelFrame(self.ocr_mode_frame, text="OCR ROI 設定", relief="flat", bd=1)
+        ocr_roi_frame.pack(fill="x", pady=(5, 3), padx=5)
+        
+        ocr_row1 = tk.Frame(ocr_roi_frame)
+        ocr_row1.pack(fill="x", padx=5, pady=2)
+        
+        tk.Label(ocr_row1, text="區域:").pack(side="left")
+        self.region_var = tk.StringVar()
+        self.region_combobox = ttk.Combobox(ocr_row1, textvariable=self.region_var, state="readonly", width=8)
+        self.region_combobox.pack(side="left", padx=2)
+        self.region_combobox.bind("<<ComboboxSelected>>", self._on_region_select)
+        
+        tk.Button(ocr_row1, text="新增", command=self._on_add_region).pack(side="left", padx=2)
+        tk.Button(ocr_row1, text="儲存組態", command=self._save_roi_config).pack(side="left", padx=2)
+        
+        ocr_row2 = tk.Frame(ocr_roi_frame)
+        ocr_row2.pack(fill="x", padx=5, pady=2)
+        
+        tk.Label(ocr_row2, text="座標:").pack(side="left")
+        for text, var_tuple in [("x1", self.roi_x1_var), ("y1", self.roi_y1_var), ("x2", self.roi_x2_var), ("y2", self.roi_y2_var)]:
+            tk.Label(ocr_row2, text=f"{text}:").pack(side="left")
+            ttk.Spinbox(ocr_row2, from_=0, to=99999, width=5, textvariable=var_tuple).pack(side="left", padx=(0,3))
+        tk.Button(ocr_row2, text="套用", command=self._apply_roi_from_fields).pack(side="left", padx=3)
+        
+        # 手術階段分析模式標籤頁
+        self.surgery_mode_frame = ttk.Frame(self.mode_notebook)
+        self.mode_notebook.add(self.surgery_mode_frame, text="手術階段分析模式")
+        
+        # 手術階段ROI 設定
+        surgery_roi_frame = tk.LabelFrame(self.surgery_mode_frame, text="手術階段ROI 設定", relief="flat", bd=1)
+        surgery_roi_frame.pack(fill="x", pady=(5, 3), padx=5)
+        
+        surgery_row1 = tk.Frame(surgery_roi_frame)
+        surgery_row1.pack(fill="x", padx=5, pady=2)
+        
+        tk.Label(surgery_row1, text="區域:").pack(side="left")
+        self.surgery_stage_region_var = tk.StringVar()
+        self.surgery_stage_combobox = ttk.Combobox(surgery_row1, textvariable=self.surgery_stage_region_var, state="readonly", width=10)
+        self.surgery_stage_combobox.pack(side="left", padx=2)
+        self.surgery_stage_combobox.bind("<<ComboboxSelected>>", self._on_surgery_stage_region_select)
+        
+        tk.Button(surgery_row1, text="新增", command=self._on_add_surgery_stage_region).pack(side="left", padx=2)
+        
+        surgery_row2 = tk.Frame(surgery_roi_frame)
+        surgery_row2.pack(fill="x", padx=5, pady=2)
+        
+        tk.Label(surgery_row2, text="座標:").pack(side="left")
+        for text, var_tuple in [("x1", self.surgery_stage_x1_var), ("y1", self.surgery_stage_y1_var), ("x2", self.surgery_stage_x2_var), ("y2", self.surgery_stage_y2_var)]:
+            tk.Label(surgery_row2, text=f"{text}:").pack(side="left")
+            ttk.Spinbox(surgery_row2, from_=0, to=99999, width=5, textvariable=var_tuple).pack(side="left", padx=(0,3))
+        tk.Button(surgery_row2, text="套用", command=self._apply_surgery_stage_roi_from_fields).pack(side="left", padx=3)
+        tk.Button(surgery_row2, text="存入快取", command=self._save_roi_to_cache, bg="lightgreen").pack(side="left", padx=2)
+        tk.Button(surgery_row2, text="查看快取", command=self._show_cache_info, bg="lightblue").pack(side="left", padx=2)
+        
+        # 綁定標籤頁切換事件
+        self.mode_notebook.bind("<<NotebookTabChanged>>", self._on_mode_tab_changed)
+        
+        # 默認選擇OCR模式標籤頁
+        self.mode_notebook.select(self.ocr_mode_frame)
+        
+        # 初始化模式相關控制項的顯示狀態
+        self._update_mode_specific_controls()
+        
+        # Header 右半邊：ROI 預覽對比 (固定寬度50%)
+        header_right = tk.Frame(header_frame, relief="sunken", bd=1)
+        header_right.pack(side="right", fill="both", expand=True, padx=(2, 5), pady=5)
+        
+        roi_compare_frame = tk.LabelFrame(header_right, text="ROI 對比")
+        roi_compare_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # 預覽圖像區域
+        preview_area = tk.Frame(roi_compare_frame)
+        preview_area.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        last_frame = tk.LabelFrame(preview_area, text="Last")
+        last_frame.pack(side="left", fill="both", expand=True, padx=(0, 2))
+        self.stage_roi_preview_label = tk.Label(last_frame, bg="black")
+        self.stage_roi_preview_label.pack(fill="both", expand=True, padx=2, pady=2)
+        
+        current_frame = tk.LabelFrame(preview_area, text="Current")
+        current_frame.pack(side="left", fill="both", expand=True, padx=(2, 0))
+        self.current_roi_preview_label = tk.Label(current_frame, bg="black")
+        self.current_roi_preview_label.pack(fill="both", expand=True, padx=2, pady=2)
+        
+        # 資訊顯示
+        info_area = tk.Frame(roi_compare_frame)
+        info_area.pack(fill="x", padx=5, pady=(0, 5))
+        
+        self.roi_diff_label = tk.Label(info_area, text="Diff: -", font=("Courier", 9))
+        self.roi_diff_label.pack(fill="x")
 
-        main_area = tk.Frame(self)
-        main_area.pack(fill="both", expand=True, padx=10, pady=5)
+        # ========================= BODY 區域 =========================
+        body_frame = tk.Frame(self)
+        body_frame.pack(fill="both", expand=True, padx=5, pady=(0, 5))
 
-        video_frame = tk.Frame(main_area, width=self.VID_W, height=self.VID_H, bd=1, relief="sunken")
-        video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        video_frame.pack_propagate(False) 
+        # Body 左側：影片顯示
+        video_frame = tk.Frame(body_frame, width=self.VID_W, height=self.VID_H, bd=1, relief="sunken")
+        video_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        video_frame.pack_propagate(False)
 
         self.lbl_video = tk.Label(video_frame, bg="black")
         self.lbl_video.pack(fill="both", expand=True)
         self.lbl_video.bind("<Button-1>", self._on_roi_start)
         self.lbl_video.bind("<B1-Motion>", self._on_roi_drag)
         self.lbl_video.bind("<ButtonRelease-1>", self._on_roi_end)
-        self.roi_rect_id = None 
+        self.roi_rect_id = None
 
         self._create_control_hint_widget(video_frame)
-        # 標註樹狀視圖  
-        tree_frame = tk.Frame(main_area)
-        tree_frame.pack(side="right", fill="y")
 
-        tree_yscroll = ttk.Scrollbar(tree_frame, orient="vertical")
+        # Body 右側：標註樹（設置固定寬度）
+        annotation_frame = tk.Frame(body_frame, width=400)
+        annotation_frame.pack(side="right", fill="y")
+        annotation_frame.pack_propagate(False)  # 防止子元件改變frame大小
+
+        tree_yscroll = ttk.Scrollbar(annotation_frame, orient="vertical")
         tree_yscroll.pack(side="right", fill="y")
-        tree_xscroll = ttk.Scrollbar(tree_frame, orient="horizontal")
+        tree_xscroll = ttk.Scrollbar(annotation_frame, orient="horizontal")
         tree_xscroll.pack(side="bottom", fill="x")
 
-        self.tree = ttk.Treeview(tree_frame, columns=("frame", "diff", "content", "current_analysis"),
+        # 初始化時使用基本欄位，後續動態調整
+        self.tree = ttk.Treeview(annotation_frame, columns=("frame", "content"),
                                  show="headings", yscrollcommand=tree_yscroll.set,
                                  xscrollcommand=tree_xscroll.set)
-        self.tree.pack(side="left", fill="y")
+        self.tree.pack(side="left", fill="both")
+        # 初始化基本欄位設置
         self.tree.heading("frame", text="幀號")
-        self.tree.heading("diff", text="Diff")
-        self.tree.heading("content", text="標註內容")  # 原有欄位改名
-        self.tree.heading("current_analysis", text="當前分析")  # 新增欄位
-        self.tree.column("frame", width=60, anchor="center")
-        self.tree.column("diff", width=80, anchor="center")
-        self.tree.column("content", width=150, anchor="center")
-        self.tree.column("current_analysis", width=150, anchor="center")
+        self.tree.heading("content", text="標註內容")
+        self.tree.column("frame", width=frame_width, anchor="center")
+        self.tree.column("content", width=content_width, anchor="center")
         tree_yscroll.config(command=self.tree.yview)
         tree_xscroll.config(command=self.tree.xview)
-        self.bold_font = tkFont.Font(weight="bold")
-        self.tree.tag_configure("changed", font=self.bold_font)
-        self.tree.tag_configure("small_diff", foreground="red")
-        # self.tree.bind("<Double-1>", self._on_tree_double_click) # Replaced by _on_edit_annotation
-        # 確保TreeView不會攔截我們需要的鍵盤事件
 
         self.tree.bind("<Double-1>", self._on_edit_annotation)
         self.tree.bind("<Return>", self._on_edit_annotation)
         self.tree.bind('<<TreeviewSelect>>', self._on_treeview_select)
         self._setup_treeview_context_menu()
 
-        bottom_frame_slider_num = tk.Frame(self)
-        bottom_frame_slider_num.pack(fill="x", padx=10, pady=(0,5))
+        # ========================= TIMELINE 區域 =========================
+        timeline_frame = tk.Frame(self, relief="groove", bd=1)
+        timeline_frame.pack(side="bottom", fill="x", padx=5, pady=5)
 
+        # --- Use a single Grid to manage all timeline components for perfect alignment ---
+        timeline_frame.grid_columnconfigure(1, weight=1)
+
+        # -- Row 0: Main Slider --
+        # Column 0: A placeholder for the main frame counter
+        slider_label_placeholder = tk.Frame(timeline_frame, width=90)
+        slider_label_placeholder.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        slider_label_placeholder.pack_propagate(False)
+
+        # The frame counter label will be created further down, and then moved here.
+        self.slider_label_placeholder = slider_label_placeholder 
+
+        slider_frame = tk.Frame(timeline_frame)
+        slider_frame.grid(row=0, column=1, sticky="ew", pady=(2, 3))
+        
         self.slider_var = tk.DoubleVar()
-        self.slider = ttk.Scale(bottom_frame_slider_num, from_=0, to=100, orient="horizontal",
+        self.slider = ttk.Scale(slider_frame, from_=0, to=100, orient="horizontal",
                                 variable=self.slider_var, command=self._on_slider_move)
         self.slider.bind("<ButtonRelease-1>", self._on_slider_release)
-        self.slider.pack(fill="x", padx=5, side="left", expand=True)
-        self.lbl_frame_num = tk.Label(bottom_frame_slider_num, text="幀: 0 / 0")
-        self.lbl_frame_num.pack(side="right", padx=5)
-        
-        # nav_frame for "Go to frame" was originally packed into main_area.
-        # If user wants it there, it needs to be:
-        # nav_frame_goto = tk.Frame(main_area) # main_area, not self
-        # nav_frame_goto.pack(side="left", after=video_frame, fill="x", pady=3) # Or some other packing
-        # For simplicity, keeping it below slider for now.
-        nav_frame_goto = tk.Frame(self) 
-        nav_frame_goto.pack(fill="x", padx=10, pady=3)
+        self.slider.pack(fill="x", expand=True)
 
-        tk.Label(nav_frame_goto, text="跳至幀:").pack(side="left", padx=(0,2))
+        # -- Row 1: Multi-Track Timelines --
+        # Column 0: A container for all track labels
+        self.timeline_labels_frame = tk.Frame(timeline_frame)
+        self.timeline_labels_frame.grid(row=1, column=0, sticky="ns", padx=(0, 2))
+
+        # Column 1: A container for all track canvases
+        stage_tag_parent_frame = tk.Frame(timeline_frame)
+        stage_tag_parent_frame.grid(row=1, column=1, sticky="nsew")
+        
+        # This frame will now directly hold the tracks, replacing the scrollable canvas
+        self.timeline_tracks_frame = tk.Frame(stage_tag_parent_frame)
+        self.timeline_tracks_frame.pack(fill="both", expand=True)
+
+        # -- Row 2: Navigation Controls --
+        nav_frame = tk.Frame(timeline_frame)
+        nav_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
+
+        # Left side: Go to frame controls
+        tk.Label(nav_frame, text="跳至幀:").pack(side="left")
         self.goto_var = tk.IntVar(value=0)
-        self.goto_entry = ttk.Entry(nav_frame_goto, textvariable=self.goto_var, width=7)
-        self.goto_entry.pack(side="left")
+        self.goto_entry = ttk.Entry(nav_frame, textvariable=self.goto_var, width=7)
+        self.goto_entry.pack(side="left", padx=2)
         self.goto_entry.bind("<Return>", self._on_goto_frame)
-        tk.Button(nav_frame_goto, text="Go", command=self._on_goto_frame)\
-            .pack(side="left", padx=3)
+        tk.Button(nav_frame, text="Go", command=self._on_goto_frame).pack(side="left", padx=3)
         
-        self.lbl_status = tk.Label(
-            self, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W
-        )
-        self.lbl_status.pack(side=tk.BOTTOM, fill=tk.X, padx=3, pady=3)
-        
-        prog_frame = tk.Frame(self)
-        prog_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0,2))
+        # Create the frame counter label directly in its final parent container
+        self.lbl_frame_num = tk.Label(self.slider_label_placeholder, text="幀: 0 / 0", font=("Arial", 9))
+        self.lbl_frame_num.pack(expand=True, fill="both")
 
-        self.progress_var = tk.IntVar()
-        self.progressbar = ttk.Progressbar(
-            prog_frame, length=280, mode="determinate", variable=self.progress_var
-        )
-        self.progressbar.pack(side="right", padx=6)
-        self.lbl_prog = tk.Label(prog_frame, text="進度: 0/0")
-        self.lbl_prog.pack(side="right")
-        
         self._update_roi_fields()
         self._update_roi_ui()
         
@@ -670,96 +685,20 @@ class VideoAnnotator(tk.Frame):
             print(f"繪製控制提示時出錯: {e}")
             traceback.print_exc()
 
-    def _load_ocr_models(self):
-        """
-        載入並設定可用的OCR模型選項，包括不同配置
-        """
-        try:
-            # 定義可用的模型選項，包括不同配置
-            model_options = [
-                "EasyOCR Default",
-                "EasyOCR High Precision",
-                "EasyOCR Fast Mode",
-                # 未來可以添加其他模型，例如：
-                # "PaddleOCR Default",
-                # "TrOCR Base",
-                # "Custom CRNN Model"
-            ]
-            
-            self.ocr_model_combobox["values"] = model_options
-            if model_options:
-                self.ocr_model_var.set(model_options[0])  # 預設選擇第一個
-            else:
-                self.ocr_model_var.set("無可用模型")
-                
-        except Exception as e:
-            print(f"設定 OCR 模型下拉框失敗: {e}")
-            if hasattr(self, 'ocr_model_var'): 
-                self.ocr_model_var.set("設定失敗")
-
-
-
-    def _on_ocr_model_change(self, event=None):
-        """處理OCR模型切換"""
-        selected_model = self.ocr_model_var.get()
-        print(f"OCR 模型更改為: {selected_model}")
-        
-        try:
-            # 根據選擇的模型配置來初始化不同的OCR介面
-            if selected_model == "EasyOCR Default":
-                self.ocr_iface = get_ocr_model(
-                    model_type="easyocr",
-                    gpu=torch.cuda.is_available(),
-                    lang_list=['en'],
-                    confidence_threshold=self.OCR_CONF_TH,
-                    debug_output=True  # 啟用調試輸出
-                )
-            elif selected_model == "EasyOCR High Precision":
-                # 高精度模式：使用更嚴格的信心閾值和更完整的字符集
-                self.ocr_iface = get_ocr_model(
-                    model_type="easyocr",
-                    gpu=torch.cuda.is_available(),
-                    lang_list=['en'],
-                    confidence_threshold=0.7,  # 更高的信心閾值
-                    debug_output=True  # 啟用調試輸出
-                )
-            elif selected_model == "EasyOCR Fast Mode":
-                # 快速模式：較低的信心閾值，可能更快但精度稍低
-                self.ocr_iface = get_ocr_model(
-                    model_type="easyocr",
-                    gpu=torch.cuda.is_available(),
-                    lang_list=['en'],
-                    confidence_threshold=0.3,  # 較低的信心閾值
-                    debug_output=True  # 啟用調試輸出
-                )
-            # 未來可以添加其他模型的初始化邏輯
-            # elif selected_model == "PaddleOCR Default":
-            #     self.ocr_iface = get_ocr_model(
-            #         model_type="paddleocr",
-            #         gpu=torch.cuda.is_available(),
-            #         lang='en'
-            #     )
-            else:
-                print(f"未知的模型配置: {selected_model}")
-                return
-                
-            self._update_status_bar(f"OCR 模型已切換至: {selected_model}")
-            print(f"OCR 模型切換成功: {selected_model}")
-            
-        except Exception as e:
-            messagebox.showerror("OCR 模型切換失敗", f"無法載入模型 {selected_model}: {e}")
-            print(f"切換 OCR 模型失敗: {e}")
-            traceback.print_exc()
-            self._update_status_bar(f"OCR 模型 {selected_model} 載入失敗")
-
     def _toggle_ocr_test_window(self, event=None):
-        """切換OCR測試視窗的顯示/隱藏"""
-        if self.ocr_test_active and self.ocr_test_window:
-            # 如果視窗已開啟，則關閉它
-            self._close_ocr_test_window()
+        """根據當前模式，切換對應的進階分析視窗"""
+        if self.surgery_stage_mode:
+            # --- 手術階段ROI模式 ---
+            if self.surgery_stage_roi_test_active and self.surgery_stage_roi_test_window:
+                self._close_surgery_stage_roi_test_window()
+            else:
+                self._show_surgery_stage_roi_test_window()
         else:
-            # 如果視窗未開啟，則顯示它
-            self._show_ocr_test_window()
+            # --- OCR ROI模式 (原始功能) ---
+            if self.ocr_test_active and self.ocr_test_window:
+                self._close_ocr_test_window()
+            else:
+                self._show_ocr_test_window()
 
     def _show_ocr_test_window(self):
         """顯示增強版OCR測試視窗 - 支援精細子區域選擇、像素顏色分析、等比例放大和二值化處理"""
@@ -782,7 +721,7 @@ class VideoAnnotator(tk.Frame):
                 
             # 創建測試視窗 - 增大尺寸以容納新功能
             self.ocr_test_window = tk.Toplevel(self.master)
-            self.ocr_test_window.title(f"OCR精細測試 - 幀 {self.current_frame_idx} - {self.ocr_model_var.get()}")
+            self.ocr_test_window.title(f"OCR精細測試 - 幀 {self.current_frame_idx}")
             self.ocr_test_window.geometry("1200x800")
             self.ocr_test_window.resizable(True, True)
             
@@ -791,8 +730,8 @@ class VideoAnnotator(tk.Frame):
             
             # 儲存原始ROI圖像用於像素顏色分析和處理
             self.roi_image_original = roi_image
-            self.roi_image_processed = None  # 處理後的圖像
-            self.is_processed_mode = False   # 當前是否為處理模式
+            self.roi_image_processed = self._load_processed_roi_from_disk() # 嘗試從磁碟載入二值化圖
+            self.is_processed_mode = self.roi_image_processed is not None # 當前是否為處理模式
             
             # 初始化子區域相關屬性
             self.sub_regions = []  # 儲存子區域座標 [(x1,y1,x2,y2), ...]
@@ -860,9 +799,9 @@ class VideoAnnotator(tk.Frame):
             btn_processing_frame.pack(fill="x", padx=5, pady=5)
             
             # 二值化切換按鈕
-            self.btn_binarize = tk.Button(btn_processing_frame, text="二值化處理", 
+            self.btn_binarize = tk.Button(btn_processing_frame, text="二值化處理" if not self.is_processed_mode else "還原原圖", 
                                          command=self._toggle_binarization,
-                                         bg="#E8F4F8", relief="raised")
+                                         bg="#E8F4F8" if not self.is_processed_mode else "#F8E8E8", relief="raised" if not self.is_processed_mode else "sunken")
             self.btn_binarize.pack(side="left", padx=(0, 5))
             
             # 處理方法選擇
@@ -879,8 +818,10 @@ class VideoAnnotator(tk.Frame):
                           value="rule", font=("Arial", 8)).pack(side="left", padx=(5, 0))
             
             # 狀態指示
-            self.processing_status_label = tk.Label(btn_processing_frame, text="原始影像", 
-                                                   font=("Arial", 9), fg="blue")
+            self.processing_status_label = tk.Label(btn_processing_frame, 
+                                                   text="原始影像" if not self.is_processed_mode else f"二值化 ({self.binarize_method.get().upper()})",
+                                                   font=("Arial", 9), 
+                                                   fg="blue" if not self.is_processed_mode else "red")
             self.processing_status_label.pack(side="right", padx=(10, 0))
             
             # ✨ 規則分割參數控制區域
@@ -1041,9 +982,6 @@ class VideoAnnotator(tk.Frame):
     def _apply_binarization(self, image: Image.Image, method: str) -> Optional[Image.Image]:
         """應用二值化處理"""
         try:
-            import cv2
-            import numpy as np
-            from sklearn.cluster import KMeans
             
             # 轉換為OpenCV格式
             cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -1078,16 +1016,6 @@ class VideoAnnotator(tk.Frame):
                 # 創建二值圖像
                 binary = np.zeros_like(gray)
                 binary[labels.reshape(gray.shape) == foreground_label] = 255
-                
-                print(f"🎯 K-means聚類中心: 暗={centers.min():.1f}, 亮={centers.max():.1f}")
-                
-                # 計算前景和背景像素數量
-                foreground_pixels = np.sum(labels == foreground_label)
-                background_pixels = np.sum(labels == background_label)
-                total_pixels = foreground_pixels + background_pixels
-                
-                print(f"📊 像素分布: 前景={foreground_pixels}({foreground_pixels/total_pixels*100:.1f}%), "
-                    f"背景={background_pixels}({background_pixels/total_pixels*100:.1f}%)")
                     
             elif method == "rule":
                 # ✨ 規則分割二值化：基於HSV飽和度和灰階值
@@ -1109,24 +1037,7 @@ class VideoAnnotator(tk.Frame):
                 # 創建二值圖像
                 binary = np.zeros_like(gray)
                 binary[foreground_mask] = 255
-                
-                # 統計資訊
-                total_pixels = gray.size
-                foreground_pixels = np.sum(foreground_mask)
-                background_pixels = total_pixels - foreground_pixels
-                
-                # 統計滿足各條件的像素數量
-                low_sat_pixels = np.sum(condition1)
-                high_gray_pixels = np.sum(condition2)
-                
-
-                # print(f"🎯 規則分割參數: HSV-S < {hsv_s_threshold}%, 灰階 > {gray_threshold}")
-                # print(f"📊 條件統計:")
-                # print(f"   低飽和度像素: {low_sat_pixels}({low_sat_pixels/total_pixels*100:.1f}%)")
-                # print(f"   高亮度像素: {high_gray_pixels}({high_gray_pixels/total_pixels*100:.1f}%)")
-                # print(f"   符合規則像素: {foreground_pixels}({foreground_pixels/total_pixels*100:.1f}%)")
-                # print(f"   背景像素: {background_pixels}({background_pixels/total_pixels*100:.1f}%)")
-                
+                                
             else:
                 print(f"未知的二值化方法: {method}")
                 return None
@@ -1182,11 +1093,54 @@ class VideoAnnotator(tk.Frame):
             # 在Canvas上顯示新圖像
             self.roi_canvas.create_image(0, 0, anchor="nw", image=self.roi_photo, tags="image")
             
-            # 重新繪製已選擇的子區域
-            self._redraw_sub_regions()
+            # 重新繪製已選擇的子區域 (OCR模式)
+            if hasattr(self, 'sub_regions') and self.sub_regions:
+                self._redraw_sub_regions()
+            
+            # 在手術階段分析模式下，繪製精細分析框
+            if hasattr(self, 'surgery_stage_roi_test_active') and self.surgery_stage_roi_test_active:
+                self._draw_sub_roi_rect_on_canvas()
             
         except Exception as e:
             print(f"更新ROI顯示時出錯: {e}")
+
+    def _draw_sub_roi_rect_on_canvas(self):
+        """在進階分析視窗的Canvas上繪製紅色精細分析框"""
+        if not self.surgery_stage_roi_test_active or not hasattr(self, 'roi_canvas'):
+            return
+
+        # 清除舊的矩形框
+        if hasattr(self, 'sub_roi_rect_id') and self.sub_roi_rect_id:
+            self.roi_canvas.delete(self.sub_roi_rect_id)
+            self.sub_roi_rect_id = None
+
+        try:
+            # 精細區域的相對座標
+            sub_roi_coords = (37, 35, 42, 55) # x=37~41, y=35~54
+            x1, y1, x2, y2 = sub_roi_coords
+
+            # 根據當前縮放比例計算Canvas上的座標
+            scale = self.zoom_level.get()
+            border_size = 2  # 與_update_roi_display中的border_size保持一致
+            
+            canvas_x1 = x1 * scale + border_size
+            canvas_y1 = y1 * scale + border_size
+            canvas_x2 = x2 * scale + border_size
+            canvas_y2 = y2 * scale + border_size
+            
+            print(f"繪製紅色框: 原始座標({x1},{y1},{x2},{y2}), 縮放({scale}), Canvas座標({canvas_x1},{canvas_y1},{canvas_x2},{canvas_y2})")
+            
+            # 繪製紅色矩形框
+            self.sub_roi_rect_id = self.roi_canvas.create_rectangle(
+                canvas_x1, canvas_y1, canvas_x2, canvas_y2,
+                outline="red", width=3, tags="sub_roi_rect"
+            )
+            print(f"紅色框ID: {self.sub_roi_rect_id}")
+            
+        except Exception as e:
+            print(f"繪製 sub ROI 框時出錯: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _analyze_all_regions_enhanced(self, roi_image: Image.Image, result_parent: tk.Widget):
         """分析所有區域（增強版 - 支援處理後圖像）"""
@@ -1295,7 +1249,6 @@ class VideoAnnotator(tk.Frame):
             # 顯示像素統計（如果是處理後的圖像）
             if self.is_processed_mode:
                 try:
-                    import numpy as np
                     sub_array = np.array(sub_image)
                     if len(sub_array.shape) == 3:
                         # RGB圖像，轉換為灰階來計算統計
@@ -1338,8 +1291,6 @@ class VideoAnnotator(tk.Frame):
     def _calculate_left_right_pixel_stats(self, gray_array: np.ndarray) -> List[Tuple[str, str]]:
         """計算左右各40像素寬區域的平均值統計"""
         try:
-            import numpy as np
-            
             height, width = gray_array.shape
             
             # 如果圖像寬度小於80像素，無法進行左右40像素的分析
@@ -1413,43 +1364,16 @@ class VideoAnnotator(tk.Frame):
         self.roi_display_scale = zoom
         self.display_w = int(self.roi_image_original.size[0] * zoom)
         self.display_h = int(self.roi_image_original.size[1] * zoom)
-        
-    # def _update_roi_display(self):
-    #     """更新ROI圖像顯示"""
-    #     try:
-    #         # 計算新的顯示尺寸
-    #         self._calculate_display_size()
-            
-    #         # 更新Canvas尺寸
-    #         self.roi_canvas.config(scrollregion=(0, 0, self.display_w, self.display_h))
-            
-    #         # 創建放大的圖像 - 使用最近鄰插值保持像素清晰
-    #         display_image = self.roi_image_original.resize(
-    #             (self.display_w, self.display_h), 
-    #             Image.Resampling.NEAREST  # 使用NEAREST保持像素邊界清晰
-    #         )
-            
-    #         # 更新PhotoImage
-    #         self.roi_photo = ImageTk.PhotoImage(display_image)
-            
-    #         # 清除舊圖像和矩形
-    #         self.roi_canvas.delete("image")
-    #         self.roi_canvas.delete("sub_rect")
-            
-    #         # 在Canvas上顯示新圖像
-    #         self.roi_canvas.create_image(0, 0, anchor="nw", image=self.roi_photo, tags="image")
-            
-    #         # 重新繪製已選擇的子區域
-    #         self._redraw_sub_regions()
-            
-    #     except Exception as e:
-    #         print(f"更新ROI顯示時出錯: {e}")
             
     def _on_zoom_change(self, value):
         """縮放改變時的處理"""
         zoom = float(value)
         self.zoom_label.config(text=f"{zoom:.1f}x")
         self._update_roi_display()
+        
+        # 縮放時也要重繪紅框
+        if self.surgery_stage_roi_test_active:
+            self._draw_sub_roi_rect_on_canvas()
         
     def _set_zoom_level(self, zoom_value):
         """設定特定的縮放級別"""
@@ -1488,50 +1412,25 @@ class VideoAnnotator(tk.Frame):
             self.sub_region_rects.append(rect_id)
             
     def _create_pixel_info_panel(self, parent):
-        """創建增強版像素資訊面板"""
-        pixel_info_frame = tk.LabelFrame(parent, text="像素顏色資訊")
-        pixel_info_frame.pack(fill="x", pady=5)
+        """創建顯示像素信息的面板"""
+        info_frame = tk.LabelFrame(parent, text="像素信息")
+        info_frame.pack(fill="x", pady=10)
+
+        # 顏色預覽塊
+        self.color_preview_label = tk.Label(info_frame, text="", bg="black", width=10, height=3, relief="sunken")
+        self.color_preview_label.pack(pady=5, padx=5, fill="x")
+
+        # 像素座標
+        self.coord_label = tk.Label(info_frame, text="座標: -, -", font=("Courier", 10))
+        self.coord_label.pack(anchor="w", padx=5)
         
-        # 第一行：座標和RGB
-        row1_frame = tk.Frame(pixel_info_frame)
-        row1_frame.pack(fill="x", padx=5, pady=2)
-        
-        tk.Label(row1_frame, text="座標:", font=("Arial", 9, "bold")).pack(side="left")
-        self.pixel_coord_label = tk.Label(row1_frame, text="(---, ---)", 
-                                         font=("Courier", 10), fg="blue", width=10)
-        self.pixel_coord_label.pack(side="left", padx=(5, 15))
-        
-        tk.Label(row1_frame, text="RGB:", font=("Arial", 9, "bold")).pack(side="left")
-        self.pixel_rgb_label = tk.Label(row1_frame, text="(---, ---, ---)", 
-                                       font=("Courier", 10), fg="red", width=15)
-        self.pixel_rgb_label.pack(side="left", padx=(5, 10))
-        
-        # 顏色顯示方塊
-        self.pixel_color_canvas = tk.Canvas(row1_frame, width=50, height=25, 
-                                           relief="sunken", bd=2)
-        self.pixel_color_canvas.pack(side="left", padx=(5, 0))
-        
-        # 第二行：HSV和灰階
-        row2_frame = tk.Frame(pixel_info_frame)
-        row2_frame.pack(fill="x", padx=5, pady=2)
-        
-        tk.Label(row2_frame, text="HSV:", font=("Arial", 9, "bold")).pack(side="left")
-        self.pixel_hsv_label = tk.Label(row2_frame, text="(---, ---, ---)", 
-                                       font=("Courier", 10), fg="purple", width=15)
-        self.pixel_hsv_label.pack(side="left", padx=(5, 15))
-        
-        tk.Label(row2_frame, text="灰階:", font=("Arial", 9, "bold")).pack(side="left")
-        self.pixel_gray_label = tk.Label(row2_frame, text="---", 
-                                        font=("Courier", 10), fg="gray", width=6)
-        self.pixel_gray_label.pack(side="left", padx=(5, 10))
-        
-        # 第三行：縮放資訊
-        row3_frame = tk.Frame(pixel_info_frame)
-        row3_frame.pack(fill="x", padx=5, pady=2)
-        
-        tk.Label(row3_frame, text="提示:", font=("Arial", 9, "bold")).pack(side="left")
-        tip_text = "Ctrl+滾輪縮放 | 拖拽選擇子區域 | 滑鼠懸停查看像素"
-        tk.Label(row3_frame, text=tip_text, font=("Arial", 8), fg="gray").pack(side="left", padx=(5, 0))
+        # 顏色值
+        self.hex_label = tk.Label(info_frame, text="HEX : #", font=("Courier", 10))
+        self.hex_label.pack(anchor="w", padx=5)
+        self.rgb_label = tk.Label(info_frame, text="RGB : -, -, -", font=("Courier", 10))
+        self.rgb_label.pack(anchor="w", padx=5)
+        self.hsv_label = tk.Label(info_frame, text="HSV : -, -, -", font=("Courier", 10))
+        self.hsv_label.pack(anchor="w", padx=5)
 
     def _on_canvas_mouse_move(self, event):
         """滑鼠在Canvas上移動時顯示像素顏色資訊"""
@@ -1552,34 +1451,28 @@ class VideoAnnotator(tk.Frame):
                 r, g, b = pixel_rgb[:3]  # 取前三個值（防止RGBA）
                 
                 # 計算HSV
-                import colorsys
                 h, s, v = colorsys.rgb_to_hsv(r/255.0, g/255.0, b/255.0)
                 h_deg = int(h * 360)
                 s_pct = int(s * 100)
                 v_pct = int(v * 100)
                 
-                # 計算灰階值
-                gray_value = int(0.299 * r + 0.587 * g + 0.114 * b)
-                
                 # 更新顯示
-                self.pixel_coord_label.config(text=f"({orig_x:3d}, {orig_y:3d})")
-                self.pixel_rgb_label.config(text=f"({r:3d}, {g:3d}, {b:3d})")
-                self.pixel_hsv_label.config(text=f"({h_deg:3d}, {s_pct:2d}%, {v_pct:2d}%)")
-                self.pixel_gray_label.config(text=f"{gray_value:3d}")
+                self.coord_label.config(text=f"座標: {orig_x}, {orig_y}")
+                hex_color = f"#{r:02x}{g:02x}{b:02x}"
+                self.hex_label.config(text=f"HEX : {hex_color.upper()}")
+                self.rgb_label.config(text=f"RGB : {r}, {g}, {b}")
+                self.hsv_label.config(text=f"HSV : {h_deg}, {s_pct}%, {v_pct}%")
                 
-                # 顯示顏色方塊
-                color_hex = f"#{r:02x}{g:02x}{b:02x}"
-                self.pixel_color_canvas.delete("all")
-                self.pixel_color_canvas.create_rectangle(0, 0, 40, 20, 
-                                                        fill=color_hex, outline="black")
+                # 更新顏色預覽塊
+                self.color_preview_label.config(bg=hex_color)
                 
             else:
                 # 座標超出範圍，清空顯示
-                self.pixel_coord_label.config(text="(---, ---)")
-                self.pixel_rgb_label.config(text="(---, ---, ---)")
-                self.pixel_hsv_label.config(text="(---, ---, ---)")
-                self.pixel_gray_label.config(text="---")
-                self.pixel_color_canvas.delete("all")
+                self.coord_label.config(text="座標: -, -")
+                self.hex_label.config(text="HEX : #")
+                self.rgb_label.config(text="RGB : -, -, -")
+                self.hsv_label.config(text="HSV : -, -, -")
+                self.color_preview_label.config(bg="black")
                 
         except Exception as e:
             print(f"顯示像素顏色時出錯: {e}")
@@ -1793,16 +1686,6 @@ class VideoAnnotator(tk.Frame):
             error_frame.pack(fill="x", padx=5, pady=2)
             tk.Label(error_frame, text=f"分析失敗: {e}", fg="red", wraplength=300).pack(padx=5, pady=2)
 
-    # def _close_ocr_test_window(self):
-    #     """關閉OCR測試視窗"""
-    #     if self.ocr_test_window:
-    #         try:
-    #             self.ocr_test_window.destroy()
-    #         except:
-    #             pass
-    #         self.ocr_test_window = None
-    #     self.ocr_test_active = False
-    #     self._update_status_bar("OCR測試視窗已關閉")
     def _close_ocr_test_window(self):
         """關閉OCR測試視窗"""
         if self.ocr_test_window:
@@ -1822,28 +1705,165 @@ class VideoAnnotator(tk.Frame):
         self.ocr_test_active = False
         self._update_status_bar("OCR精細測試視窗已關閉")
 
-    def _get_current_frame_roi(self) -> Optional[Image.Image]:
-        """獲取當前幀的ROI圖像"""
+    def _show_surgery_stage_roi_test_window(self):
+        """顯示手術階段ROI的進階分析視窗"""
+        if not self.video_file_path or not self.current_surgery_stage_region:
+            messagebox.showwarning("提示", "請先載入影片並選擇一個手術階段ROI區域")
+            return
+            
+        if self.surgery_stage_roi_test_window:
+            self.surgery_stage_roi_test_window.lift()
+            self.surgery_stage_roi_test_window.focus_set()
+            return
+
         try:
+            # 獲取當前幀的完整圖像
+            full_frame_pil = self._get_full_frame_image_with_cache(self.current_frame_idx)
+            if full_frame_pil is None:
+                messagebox.showerror("錯誤", f"無法讀取幀 {self.current_frame_idx} 的圖像")
+                return
+
+            # 獲取ROI座標並裁剪
+            coords = self.surgery_stage_roi_dict.get(self.current_surgery_stage_region)
+            if not coords or len(coords) < 4:
+                messagebox.showerror("錯誤", f"找不到區域 '{self.current_surgery_stage_region}' 的有效ROI座標")
+                return
+            
+            roi_image = full_frame_pil.crop(tuple(coords))
+
+            # --- 創建視窗 ---
+            self.surgery_stage_roi_test_window = tk.Toplevel(self.master)
+            self.surgery_stage_roi_test_window.title(f"手術階段ROI分析 - {self.current_surgery_stage_region} (幀 {self.current_frame_idx})")
+            self.surgery_stage_roi_test_window.geometry("1000x700")
+            self.surgery_stage_roi_test_window.protocol("WM_DELETE_WINDOW", self._close_surgery_stage_roi_test_window)
+
+            # --- 初始化屬性 (與OCR視窗類似) ---
+            self.roi_image_original = roi_image
+            self.zoom_level = tk.DoubleVar(value=8.0)  # 預設放大8倍
+            self.min_zoom = 1.0
+            self.max_zoom = 30.0
+            self.is_processed_mode = False # 初始化缺失的屬性
+            self.sub_region_rects = [] # 初始化缺失的屬性
+
+            # --- 創建UI組件 ---
+            main_frame = tk.Frame(self.surgery_stage_roi_test_window)
+            main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+            # 左側：圖像顯示和控制
+            left_frame = tk.Frame(main_frame)
+            left_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+            
+            # 右側：像素資訊面板
+            right_frame = tk.Frame(main_frame, width=250)
+            right_frame.pack(side="right", fill="y")
+            right_frame.pack_propagate(False)
+
+            # 圖像顯示區域
+            img_container = tk.LabelFrame(left_frame, text=f"ROI放大圖: {roi_image.size[0]}x{roi_image.size[1]} 像素")
+            img_container.pack(fill="both", expand=True)
+
+            canvas_frame = tk.Frame(img_container)
+            canvas_frame.pack(fill="both", expand=True, padx=5, pady=5)
+            h_scrollbar = ttk.Scrollbar(canvas_frame, orient="horizontal")
+            v_scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical")
+            
+            self.roi_canvas = tk.Canvas(canvas_frame, bg="white", xscrollcommand=h_scrollbar.set, yscrollcommand=v_scrollbar.set)
+            h_scrollbar.config(command=self.roi_canvas.xview)
+            v_scrollbar.config(command=self.roi_canvas.yview)
+            
+            self.roi_canvas.grid(row=0, column=0, sticky="nsew")
+            h_scrollbar.grid(row=1, column=0, sticky="ew")
+            v_scrollbar.grid(row=0, column=1, sticky="ns")
+            canvas_frame.grid_rowconfigure(0, weight=1)
+            canvas_frame.grid_columnconfigure(0, weight=1)
+
+            # 像素資訊面板
+            self._create_pixel_info_panel(right_frame)
+
+            # 縮放控制
+            zoom_frame = tk.LabelFrame(right_frame, text="縮放控制")
+            zoom_frame.pack(fill="x", pady=10)
+            zoom_scale = ttk.Scale(zoom_frame, from_=self.min_zoom, to=self.max_zoom, variable=self.zoom_level, orient="horizontal", command=self._on_zoom_change)
+            zoom_scale.pack(fill="x", padx=5, pady=5)
+            self.zoom_label = tk.Label(zoom_frame, text="8.0x", font=("Courier", 10))
+            self.zoom_label.pack()
+
+            # 差異值視覺化 (以矩形陣列顯示)
+            diff_frame = tk.LabelFrame(right_frame, text="顏色差異視覺化 (RMSE)")
+            diff_frame.pack(fill="x", pady=10)
+            # 5x20 的矩形，每格預設 20px
+            self.diff_canvas = tk.Canvas(diff_frame, width=120, height=420, bg="white", highlightthickness=1, highlightbackground="gray")
+            self.diff_canvas.pack(fill="both", expand=True, padx=5, pady=5)
+
+            # --- 綁定事件並更新顯示 ---
+            self._update_roi_display() # 複用此方法來更新canvas
+            self.roi_canvas.bind("<Motion>", self._on_canvas_mouse_move) # 複用此方法
+            self.roi_canvas.bind("<MouseWheel>", self._on_mouse_wheel) # 複用此方法
+
+            self.surgery_stage_roi_test_active = True
+            self._update_status_bar(f"手術階段ROI分析視窗已開啟 ({self.current_surgery_stage_region})")
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"無法顯示手術階段ROI分析視窗: {e}")
+            traceback.print_exc()
+
+    def _close_surgery_stage_roi_test_window(self):
+        """關閉手術階段ROI分析視窗"""
+        if self.surgery_stage_roi_test_window:
+            try:
+                self.surgery_stage_roi_test_window.destroy()
+            except:
+                pass
+            self.surgery_stage_roi_test_window = None
+        self.surgery_stage_roi_test_active = False
+        self._update_status_bar("手術階段ROI分析視窗已關閉")
+
+    def _refresh_surgery_stage_test_window(self, full_frame_pil: Image.Image):
+        """刷新手術階段ROI分析視窗的內容"""
+        if not self.surgery_stage_roi_test_active or not self.current_surgery_stage_region:
+            return
+
+        try:
+            # 更新視窗標題
+            self.surgery_stage_roi_test_window.title(f"手術階段ROI分析 - {self.current_surgery_stage_region} (幀 {self.current_frame_idx})")
+            
+            # 重新裁剪ROI
+            coords = self.surgery_stage_roi_dict.get(self.current_surgery_stage_region)
+            if not coords or len(coords) < 4: return
+            self.roi_image_original = full_frame_pil.crop(tuple(coords))
+
+            # 刷新顯示
+            self._update_roi_display() # 這會重繪放大圖和紅色框
+
+        except Exception as e:
+            print(f"刷新手術階段分析視窗時出錯: {e}")
+            traceback.print_exc()
+
+    def _get_current_frame_roi(self) -> Optional[Image.Image]:
+        """獲取當前幀的ROI圖像 - 優先從磁碟讀取"""
+        try:
+            # 1. 優先從 data/<video>/<region>/frame_xxx.png 讀取
+            roi_image = self._load_roi_from_file(self.current_frame_idx)
+            if roi_image:
+                print(f"從磁碟快取成功載入 ROI: frame_{self.current_frame_idx}.png")
+                return roi_image
+
+            # 2. 如果磁碟快取不存在，再從影片即時裁切
+            print(f"ROI快取不存在，嘗試從影片即時裁切 frame {self.current_frame_idx}")
             if not self.cap_ui or not self.cap_ui.isOpened():
                 print("UI VideoCapture 未開啟")
                 return None
-                
             if not self.roi_coords:
                 print("ROI 坐標未設定")
                 return None
-                
-            # 讀取當前幀
+            
             self.cap_ui.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame_idx)
             ret, frame = self.cap_ui.read()
             if not ret:
                 print(f"無法讀取幀 {self.current_frame_idx}")
                 return None
-                
-            # 轉換為PIL圖像
-            frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             
-            # 裁切ROI
+            frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             roi_image = self._crop_roi(frame_pil)
             return roi_image
             
@@ -1852,63 +1872,25 @@ class VideoAnnotator(tk.Frame):
             traceback.print_exc()
             return None
 
-    def _perform_ocr_test(self, roi_image: Image.Image, result_frame: tk.Frame):
-        """執行OCR測試 - 修正OCR方法名稱"""
-        # 清空之前的結果
-        for widget in result_frame.winfo_children():
-            widget.destroy()
-        
+    def _load_processed_roi_from_disk(self) -> Optional[Image.Image]:
+        """從磁碟載入預處理好的二值化ROI圖像"""
         try:
-            # 執行OCR - 修正方法名稱
-            try:
-                if hasattr(self.ocr_iface, 'recognize'):
-                    # 使用 recognize 方法（返回 text, confidence）
-                    ocr_result, confidence = self.ocr_iface.recognize(roi_image)
-                elif hasattr(self.ocr_iface, 'predict'):
-                    # 備用：如果有 predict 方法
-                    ocr_result = self.ocr_iface.predict(roi_image)
-                    confidence = getattr(self.ocr_iface, 'last_confidence', None)
-                else:
-                    # 如果都沒有，嘗試直接調用
-                    ocr_result = str(self.ocr_iface(roi_image))
-                    confidence = None
-                    
-            except Exception as ocr_error:
-                print(f"OCR調用失敗: {ocr_error}")
-                ocr_result = "〈OCR錯誤〉"
-                confidence = None
+            if not self.video_file_path or not self.region_name:
+                return None
             
-            # 顯示結果
-            result_text = ocr_result if ocr_result else "〈未識別〉"
-            
-            tk.Label(result_frame, text="識別結果:", 
-                    font=("Arial", 12, "bold")).pack(anchor="w", pady=(5, 2))
-            
-            result_label = tk.Label(result_frame, text=result_text,
-                                   font=("Arial", 14), fg="darkgreen" if ocr_result else "red")
-            result_label.pack(anchor="w", pady=(0, 5))
-            
-            # 顯示置信度
-            if confidence is not None:
-                confidence_text = f"置信度: {confidence:.3f}"
-                confidence_color = "darkgreen" if confidence > 0.7 else "orange" if confidence > 0.4 else "red"
-                tk.Label(result_frame, text=confidence_text,
-                        font=("Arial", 10), fg=confidence_color).pack(anchor="w")
-            
-            # 顯示圖像信息
-            img_info = f"圖像尺寸: {roi_image.size[0]} × {roi_image.size[1]} 像素"
-            tk.Label(result_frame, text=img_info,
-                    font=("Arial", 9), fg="gray").pack(anchor="w", pady=(5, 0))
-            
-            print(f"OCR測試結果: '{result_text}'")
-            if confidence is not None:
-                print(f"置信度: {confidence:.3f}")
-                
+            video_name = self.video_file_path.stem
+            # 預處理好的二值化圖路徑
+            binary_path = Path("data") / video_name / self.region_name / f"frame_{self.current_frame_idx}_binary.png"
+
+            if binary_path.exists():
+                print(f"找到預處理的二值化ROI: {binary_path.name}")
+                return Image.open(binary_path)
+            else:
+                print(f"未找到預處理的二值化ROI: {binary_path.name}")
+                return None
         except Exception as e:
-            print(f"OCR測試時出錯: {e}")
-            traceback.print_exc()
-            tk.Label(result_frame, text=f"測試失敗: {e}",
-                    font=("Arial", 10), fg="red").pack(pady=10)
+            print(f"從磁碟載入二值化ROI時出錯: {e}")
+            return None
 
     def _load_video(self):
         """載入影片檔案"""
@@ -1927,15 +1909,7 @@ class VideoAnnotator(tk.Frame):
                 messagebox.showerror("錯誤", "無法開啟影片檔案 (UI Capture)")
                 self.video_file_path = None
                 return
-            # meta_frames = int(self.cap_ui.get(cv2.CAP_PROP_FRAME_COUNT))
-            # real_frames = 0
-            # while self.cap_ui.grab():  # 使用 grab() 較快
-            #     real_frames += 1
-            # self.cap_ui.release()
-            # if real_frames != meta_frames:
-            #     print(f"⚠️ 幀數校正: {meta_frames} → {real_frames}")
-            # self.total_frames = real_frames
-            # print(f"_load_video self.total_frames: {self.total_frames}")
+
             self.total_frames = int(self.cap_ui.get(cv2.CAP_PROP_FRAME_COUNT))
             self.original_vid_w = int(self.cap_ui.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.original_vid_h = int(self.cap_ui.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1947,7 +1921,14 @@ class VideoAnnotator(tk.Frame):
                  self.lbl_video_path.config(text=str(self.video_file_path.name))
             
             self._load_roi_config() 
-            self._load_existing_data() 
+            self._load_surgery_stage_roi_config()  # 加載手術階段ROI配置
+            self._load_existing_data()
+            
+            # 確保UI已正確更新
+            if hasattr(self, 'region_combobox'):
+                self._update_roi_ui()
+            if hasattr(self, 'surgery_stage_combobox'):
+                self._update_surgery_stage_roi_ui()
             
             if hasattr(self, 'slider'):
                 self.slider.config(to=self.total_frames - 1 if self.total_frames > 0 else 0, 
@@ -1960,225 +1941,24 @@ class VideoAnnotator(tk.Frame):
                 if hasattr(self, 'lbl_frame_num'): self.lbl_frame_num.config(text="幀: 0 / 0")
                 if hasattr(self, 'lbl_video'): self.lbl_video.config(image=None)
 
-            if self.total_frames > 0 and hasattr(self, 'btn_analyze'):
-                 self.btn_analyze.config(state=tk.NORMAL)
-            else:
-                 if hasattr(self, 'btn_analyze'): self.btn_analyze.config(state=tk.DISABLED)
-
             self._update_status_bar(f"已載入: {self.video_title} ({self.total_frames} 幀, {fps:.1f} FPS)")
             print(f"影片載入成功: {self.total_frames} 幀, 解析度: {self.original_vid_w}x{self.original_vid_h}")
+            
+            # 設定 FPS 供換算秒數
+            self.fps = fps if fps and fps > 0 else 30.0
+            
+            # 載入階段分析（若存在）並渲染標籤
+            self._load_stage_analysis()
+            self._refresh_stage_tag_ui()
+            
+            # 預載入OCR數據以優化性能
+            self._preload_ocr_data()
             
         except Exception as e:
             messagebox.showerror("錯誤", f"載入影片失敗: {e}")
             print(f"載入影片失敗: {e}")
             traceback.print_exc()
             self.video_file_path = None 
-            if hasattr(self, 'btn_analyze'): self.btn_analyze.config(state=tk.DISABLED)
-
-    def _start_analysis_thread(self, tmad_threshold: float, diff_threshold: int):
-        """啟動（單一）分析執行緒，傳入當前閾值"""
-        if self.analysis_thread and self.analysis_thread.is_alive():
-            print("警告：分析執行緒已在運行中。")
-            return
-
-        self.stop_event.clear()
-        
-        # 清空結果佇列，其他佇列不再使用
-        while not self.result_queue.empty():
-            try:
-                self.result_queue.get_nowait()
-            except queue.Empty:
-                break
-        
-        try:
-            self.analysis_thread = threading.Thread(
-                target=self._master_analysis_worker,
-                args=(tmad_threshold, diff_threshold), # 傳遞閾值
-                daemon=True,
-                name="MasterAnalysisThread"
-            )
-            self.analysis_thread.start()
-            print(f"主分析執行緒已啟動 (region: {self.region_name})")
-            
-        except Exception as e:
-            print(f"啟動主分析執行緒失敗: {e}")
-            self._update_status_bar(f"啟動分析失敗: {e}")
-            if hasattr(self, 'btn_analyze'): self.btn_analyze.config(state=tk.NORMAL)
-            if hasattr(self, 'btn_stop'): self.btn_stop.config(state=tk.DISABLED)
-
-
-    def _master_analysis_worker(self, tmad_threshold_val: float, diff_threshold_val: int):
-        """
-        單一背景執行緒，智能分析模式：
-        - 如果已有變化幀資料，只對變化幀進行OCR
-        - 如果沒有變化幀資料，執行完整的變化偵測+OCR
-        """
-        print(f"主分析執行緒開始工作 (region: {self.region_name})")
-        print(f"  使用 T-MAD 閾值: {tmad_threshold_val}, 忽略差異閾值: {diff_threshold_val}")
-
-        worker_cap = None
-        if not self.video_file_path:
-            print("主分析執行緒錯誤：影片路徑未設定。")
-            self.result_queue.put_nowait(("progress", 0, 0, "error_no_video"))
-            return
-        
-        try:
-            worker_cap = cv2.VideoCapture(str(self.video_file_path))
-            if not worker_cap.isOpened():
-                print(f"主分析執行緒錯誤：無法開啟影片 {self.video_file_path}")
-                self.result_queue.put_nowait(("progress", 0, self.total_frames, "error_open_video"))
-                return
-
-            # 檢查是否已有變化幀資料
-            existing_change_frames = [f for f, has_change in self.change_cache.items() if has_change]
-            
-            if existing_change_frames:
-                # 智能模式：只對已知變化幀進行OCR
-                print(f"🚀 智能分析模式：檢測到 {len(existing_change_frames)} 個既有變化幀，只進行OCR分析")
-                self._ocr_only_analysis(worker_cap, existing_change_frames)
-            else:
-                # 完整模式：變化偵測 + OCR
-                print(f"🔍 完整分析模式：未檢測到既有變化幀，執行完整分析 ({self.total_frames} 幀)")
-                self._full_analysis(worker_cap, tmad_threshold_val, diff_threshold_val)
-
-        except Exception as e:
-            print(f"主分析執行緒發生錯誤: {e}")
-            traceback.print_exc()
-            try:
-                self.result_queue.put_nowait(("progress", 0, self.total_frames, "error"))
-            except queue.Full: 
-                pass
-        finally:
-            if worker_cap:
-                worker_cap.release()
-            print(f"主分析執行緒結束，釋放VideoCapture。")
-            self.after(0, self._check_analysis_completion_status)
-
-    def _ocr_only_analysis(self, worker_cap: cv2.VideoCapture, change_frames: List[int]):
-        """只對指定的變化幀進行OCR分析"""
-        total_frames_to_process = len(change_frames)
-        self.result_queue.put_nowait(("progress", 0, total_frames_to_process, "processing"))
-        
-        frames_processed = 0
-        
-        for i, frame_idx in enumerate(sorted(change_frames)):
-            if self.stop_event.is_set():
-                print(f"OCR分析在幀 {frame_idx} 被停止。")
-                self.result_queue.put_nowait(("progress", frames_processed, total_frames_to_process, "stopped"))
-                break
-
-            try:
-                # 執行OCR
-                ocr_text = self._perform_ocr(frame_idx, worker_cap)
-                self.ocr_cache[frame_idx] = ocr_text
-                
-                # 將OCR結果儲存到當前分析快取
-                self.current_analysis_cache[frame_idx] = ocr_text
-                try:
-                    self.result_queue.put_nowait(("current_analysis", frame_idx, ocr_text))
-                except queue.Full: 
-                    pass
-
-                frames_processed += 1
-                
-                # 更新進度
-                try:
-                    self.result_queue.put_nowait(("progress", frames_processed, total_frames_to_process, "processing"))
-                except queue.Full: 
-                    pass
-                
-                if frames_processed % 50 == 0:
-                    print(f"OCR分析進度：已處理 {frames_processed}/{total_frames_to_process} 個變化幀")
-
-            except Exception as e:
-                print(f"OCR分析幀 {frame_idx} 時出錯: {e}")
-                frames_processed += 1  # 仍然計入進度，避免卡住
-        
-        if not self.stop_event.is_set():
-            print(f"✅ OCR分析完成，共處理 {total_frames_to_process} 個變化幀")
-            self.result_queue.put_nowait(("progress", total_frames_to_process, total_frames_to_process, "completed"))
-
-    def _full_analysis(self, worker_cap: cv2.VideoCapture, tmad_threshold_val: float, diff_threshold_val: int):
-        """執行完整的變化偵測 + OCR分析"""
-        self.result_queue.put_nowait(("progress", 0, self.total_frames, "processing"))
-        frames_actually_processed = 0
-
-        for frame_idx in range(self.total_frames):
-            if self.stop_event.is_set():
-                print(f"完整分析在幀 {frame_idx} 被停止。")
-                self.result_queue.put_nowait(("progress", frames_actually_processed, self.total_frames, "stopped"))
-                break
-
-            try:
-                # 1. 變化偵測
-                has_change = self._detect_frame_change2(frame_idx, worker_cap, tmad_threshold_val, diff_threshold_val)
-                self.change_cache[frame_idx] = has_change
-                try:
-                    self.result_queue.put_nowait(("change", frame_idx, has_change))
-                except queue.Full: 
-                    pass
-
-                # 2. 如果有變化，執行 OCR
-                if has_change:
-                    ocr_text = self._perform_ocr(frame_idx, worker_cap)
-                    self.ocr_cache[frame_idx] = ocr_text
-                    
-                    # 總是將OCR結果儲存到當前分析快取
-                    self.current_analysis_cache[frame_idx] = ocr_text
-                    try:
-                        self.result_queue.put_nowait(("current_analysis", frame_idx, ocr_text))
-                    except queue.Full: 
-                        pass
-
-                frames_actually_processed += 1
-                
-                # 3. 更新進度
-                try:
-                    self.result_queue.put_nowait(("progress", frames_actually_processed, self.total_frames, "processing"))
-                except queue.Full: 
-                    pass
-                
-                if frames_actually_processed % 200 == 0:
-                    print(f"完整分析進度：已處理 {frames_actually_processed}/{self.total_frames} 幀")
-
-            except Exception as e:
-                print(f"完整分析幀 {frame_idx} 時出錯: {e}")
-                frames_actually_processed += 1  # 仍然計入進度，避免卡住
-
-        if not self.stop_event.is_set():
-            print(f"✅ 完整分析完成，共處理 {self.total_frames} 幀")
-            self.result_queue.put_nowait(("progress", self.total_frames, self.total_frames, "completed"))
-
-    def _check_analysis_completion_status(self):
-        """Called after master_analysis_worker finishes or is stopped."""
-        if not (self.analysis_thread and self.analysis_thread.is_alive()):
-            is_stopped_by_user = self.stop_event.is_set()
-            # Check last progress message or rely on flags
-            
-            final_progress_val = self.progress_var.get()
-            
-            if not is_stopped_by_user and final_progress_val >= self.total_frames :
-                self._on_analysis_complete() # Call if naturally completed
-            elif is_stopped_by_user:
-                self._update_status_bar("分析已手動停止。")
-                if hasattr(self, 'btn_analyze'): self.btn_analyze.config(state=tk.NORMAL)
-                if hasattr(self, 'btn_stop'): self.btn_stop.config(state=tk.DISABLED)
-            else: # Ended due to error or incompletely
-                self._update_status_bar("分析未完成或發生錯誤。")
-                if hasattr(self, 'btn_analyze'): self.btn_analyze.config(state=tk.NORMAL)
-                if hasattr(self, 'btn_stop'): self.btn_stop.config(state=tk.DISABLED)
-    
-    # _analysis_worker and _ocr_worker are removed.
-    # _enqueue_frames_for_analysis is removed.
-
-    def _save_roi_image(self, frame_idx: int, roi_pil: Image.Image):
-        """儲存 ROI 圖像到檔案"""
-        try:
-            roi_dir = self._get_roi_dir(self.region_name) 
-            png_path = roi_dir / f"frame_{frame_idx}.png"
-            roi_pil.save(png_path, "PNG")
-        except Exception as e:
-            print(f"[ERR] 儲存 ROI 圖像 {frame_idx} 失敗: {e}")
 
     def _load_roi_from_file(self, frame_idx: int) -> Optional[Image.Image]:
         """從檔案載入 ROI 圖像"""
@@ -2192,101 +1972,110 @@ class VideoAnnotator(tk.Frame):
             print(f"[ERR] 讀取 ROI 圖像 {frame_idx} 失敗: {e}")
             return None
 
-    def _calculate_binary_diff(self, img1: np.ndarray, img2: np.ndarray) -> float:
-        if img1.shape != img2.shape:
-            return 0.0
-        b1 = (img1 > 127).astype(np.uint8)
-        b2 = (img2 > 127).astype(np.uint8)
-        diff = np.logical_xor(b1, b2)
-        return float(np.mean(diff))
-
     def _show_frame(self, frame_idx: int):
         """
-        顯示指定幀：
+        顯示指定幀，優先從磁碟快取讀取，若無快取則從影片讀取並生成快取。
         - 預設模式：顯示整個frame並畫ROI紅框
-        - 二值化模式：只顯示ROI區域的二值化圖，寬度與主畫面一致，高度等比例縮放並置中
+        - 二值化模式：只顯示ROI區域的二值化圖
         """
-        if not self.cap_ui or not self.cap_ui.isOpened():
-            print(f"警告：UI VideoCapture 未開啟或未設定，無法顯示幀 {frame_idx}")
-            return
         if not (0 <= frame_idx < self.total_frames):
+            print(f"警告：請求的幀 {frame_idx} 超出範圍 (0-{self.total_frames-1})")
             return
 
-        print(f"顯示幀: {frame_idx}")
+        frame_pil = self._get_full_frame_image_with_cache(frame_idx)
+        if frame_pil is None:
+            print(f"錯誤：無法為幀 {frame_idx} 獲取圖像。")
+            self.lbl_video.config(image=None) # 清空畫面
+            return
 
-        if not self.binarize_mode_var.get():
-            # === 預設模式 ===
-            self.cap_ui.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame_bgr = self.cap_ui.read()
-            if not ret:
-                print(f"警告：無法讀取幀 {frame_idx}")
-                return
-            frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-
-            disp_pil = frame_pil.resize((self.VID_W, self.VID_H), Image.BILINEAR)
-            if self.roi_coords and self.original_vid_w > 0 and self.original_vid_h > 0:
-                draw = ImageDraw.Draw(disp_pil)
-                scale_x = self.VID_W / self.original_vid_w
-                scale_y = self.VID_H / self.original_vid_h
-                x1, y1, x2, y2 = self.roi_coords
-                draw.rectangle(
-                    [x1*scale_x, y1*scale_y, x2*scale_x, y2*scale_y],
-                    outline="red", width=2
-                )
-            self.current_display_image = ImageTk.PhotoImage(disp_pil)
-            self.lbl_video.config(image=self.current_display_image)
-        else:
-            # === 二值化模式 ===
-            roi_img = self._get_roi_image(frame_idx, self.cap_ui)
-            if roi_img is None:
-                print(f"無法取得 ROI 圖像: 幀 {frame_idx}")
-                self.lbl_video.config(image=None)
-            else:
-                # 應用三種二值化方法之一
-                bin_method = self.binarize_method_var.get()
-                bin_img = self._apply_binarization(roi_img, bin_method)
-                if bin_img is None:
-                    print(f"二值化失敗，顯示原始 ROI")
-                    bin_img = roi_img
-
-                # --- 等比例放大 ROI 到 self.VID_W 寬 ---
-                roi_w, roi_h = bin_img.size
-                scale = self.VID_W / roi_w
-                new_w = self.VID_W
-                new_h = int(roi_h * scale)
-                disp_pil = bin_img.resize((new_w, new_h), Image.NEAREST)
-
-                # --- 建立黑底畫布，將 ROI 圖置中 ---
-                canvas = Image.new("L" if disp_pil.mode == "L" else "RGB", (self.VID_W, self.VID_H), color=0)
-                top = (self.VID_H - new_h) // 2
-                canvas.paste(disp_pil, (0, top))
-                self.current_display_image = ImageTk.PhotoImage(canvas)
-                self.lbl_video.config(image=self.current_display_image)
-
-        # --- 更新 Slider/Label 顯示 ---
+        # --- 更新 Slider/Label 顯示 (提前更新，確保UI同步) ---
         self.slider_var.set(frame_idx)
         self.lbl_frame_num.config(text=f"幀: {frame_idx} / {self.total_frames-1 if self.total_frames > 0 else 0}")
         self.current_frame_idx = frame_idx
         self.goto_var.set(frame_idx)
+        
+        # --- 如果手術階段分析視窗已開啟，則更新它 ---
+        if self.surgery_stage_roi_test_active and self.surgery_stage_roi_test_window:
+            self._refresh_surgery_stage_test_window(frame_pil)
+        
+        # --- 手術階段模式下進行快取比對 ---
+        if self.surgery_stage_mode and self.current_surgery_stage_region:
+            self._perform_cache_comparison(frame_pil)
+        
+        display_image = None
 
-        # --- 顯示 diff 值與變化判定 ---
-        diff_text = "Diff: -"
-        if frame_idx > 0:
-            roi_img1 = self._get_roi_image(frame_idx - 1, self.cap_ui)
-            roi_img2 = self._get_roi_image(frame_idx, self.cap_ui)
-            if roi_img1 and roi_img2:
-                bin_method = self.binarize_method_var.get()
-                bin1 = self._apply_binarization(roi_img1, bin_method)
-                bin2 = self._apply_binarization(roi_img2, bin_method)
-                if bin1 and bin2:
-                    arr1 = np.array(bin1.convert("L"))
-                    arr2 = np.array(bin2.convert("L"))
-                    diff = self._calculate_binary_diff(arr1, arr2)
-                    diff_text = f"Diff: {diff:.4f}"
-        self.lbl_diff.config(text=diff_text)
+        if not self.binarize_mode_var.get():
+            # === 預設模式: 顯示完整幀與ROI框 ===
+            disp_pil = frame_pil.resize((self.VID_W, self.VID_H), Image.Resampling.BILINEAR)
+            
+            # 根據當前模式繪製相應的ROI框
+            if self.original_vid_w > 0 and self.original_vid_h > 0:
+                draw = ImageDraw.Draw(disp_pil)
+                scale_x = self.VID_W / self.original_vid_w
+                scale_y = self.VID_H / self.original_vid_h
+                
+                if self.surgery_stage_mode:
+                    # 手術階段ROI模式：顯示所有手術階段ROI框
+                    for region_name, coords in self.surgery_stage_roi_dict.items():
+                        if coords and len(coords) >= 4:
+                            x1, y1, x2, y2 = coords
+                            # 當前選中的區域用藍色框，其他用綠色框
+                            color = "blue" if region_name == self.current_surgery_stage_region else "green"
+                            width = 3 if region_name == self.current_surgery_stage_region else 2
+                            draw.rectangle(
+                                [x1*scale_x, y1*scale_y, x2*scale_x, y2*scale_y],
+                                outline=color, width=width
+                            )
+                            # 添加區域名稱標籤
+                            text_x = x1*scale_x + 5
+                            text_y = y1*scale_y - 15 if y1*scale_y > 15 else y1*scale_y + 5
+                            draw.text((text_x, text_y), region_name, fill=color)
+                else:
+                    # OCR ROI模式：顯示OCR ROI框
+                    if self.roi_coords:
+                        x1, y1, x2, y2 = self.roi_coords
+                        draw.rectangle(
+                            [x1*scale_x, y1*scale_y, x2*scale_x, y2*scale_y],
+                            outline="red", width=2
+                        )
+                        # 添加OCR區域標籤
+                        if self.region_name:
+                            text_x = x1*scale_x + 5
+                            text_y = y1*scale_y - 15 if y1*scale_y > 15 else y1*scale_y + 5
+                            draw.text((text_x, text_y), f"OCR-{self.region_name}", fill="red")
+            
+            display_image = disp_pil
+        else:
+            # === 二值化模式: 只顯示ROI區域的二值化圖 ===
+            roi_img = self._crop_roi(frame_pil)
+            if roi_img is None:
+                print(f"無法取得 ROI 圖像: 幀 {frame_idx}")
+                self.lbl_video.config(image=None)
+                return
+            
+            bin_method = self.binarize_method_var.get()
+            bin_img = self._apply_binarization(roi_img, bin_method)
+            if bin_img is None:
+                print(f"二值化失敗，顯示原始 ROI")
+                bin_img = roi_img
 
-        is_change = self.change_cache.get(frame_idx, False)
-        self.lbl_change.config(text=f"變化判定: {'變化' if is_change else '未變化'}")
+            roi_w, roi_h = bin_img.size
+            if roi_w == 0:
+                print(f"警告: 二值化後的ROI寬度為0 (幀 {frame_idx})")
+                return 
+            scale = self.VID_W / roi_w
+            new_w = self.VID_W
+            new_h = int(roi_h * scale)
+            disp_pil = bin_img.resize((new_w, new_h), Image.Resampling.NEAREST)
+
+            canvas = Image.new("L" if disp_pil.mode == "L" else "RGB", (self.VID_W, self.VID_H), color=0)
+            top = (self.VID_H - new_h) // 2
+            canvas.paste(disp_pil, (0, top))
+            display_image = canvas
+
+        if display_image:
+            self.current_display_image = ImageTk.PhotoImage(display_image)
+            self.lbl_video.config(image=self.current_display_image)
 
         # --- 控制提示圖示與焦點 ---
         if hasattr(self, 'control_hint_frame') and self.control_hint_frame:
@@ -2295,6 +2084,388 @@ class VideoAnnotator(tk.Frame):
             except:
                 pass
         self.master.focus_set()
+
+        # 更新 STAGE ROI 預覽
+        self._update_stage_roi_preview(frame_pil)
+        
+        # 更新多軌道時間軸上的位置指示器
+        self._update_track_position_indicators()
+        
+        # 智能同步表格選擇（避免arrow key導航時的干擾）
+        self._auto_sync_treeview(frame_idx)
+
+    def _auto_sync_treeview(self, frame_idx: int):
+        """智能自動同步表格選擇"""
+        # 如果是arrow key導航，跳過同步
+        if self._is_arrow_key_navigation:
+            self._is_arrow_key_navigation = False  # 重置標記
+            return
+        
+        # 如果用戶手動點擊了表格，跳過同步並重置標誌
+        if self._user_clicked_treeview:
+            self._user_clicked_treeview = False
+            return
+            
+        # 只在手術階段模式下自動同步
+        if not self.surgery_stage_mode:
+            return
+            
+        # 避免在同步進行中觸發
+        if self._sync_in_progress:
+            return
+            
+        # 執行同步
+        self._sync_treeview_selection_to_frame(frame_idx)
+
+    def _update_stage_roi_preview(self, full_frame_pil: Image.Image):
+        """更新右側 Prev/Current ROI 對比視圖。
+
+        - 手術階段模式：使用當前選中的手術階段 ROI
+        - OCR 模式：使用當前 OCR ROI (self.roi_coords)
+        """
+        if not self.surgery_stage_roi_dict or "PEDAL" not in self.surgery_stage_roi_dict:
+            # 允許在 OCR 模式下仍然顯示對比
+            pass
+
+        try:
+            # 如果不是手術階段模式，改為 OCR ROI 對比並提早返回
+            if not self.surgery_stage_mode:
+                if not self.roi_coords:
+                    return
+                x1, y1, x2, y2 = self.roi_coords
+                curr_roi_image = full_frame_pil.crop((x1, y1, x2, y2))
+                prev_image = None
+                if self.current_frame_idx > 0:
+                    prev_full = self._get_full_frame_image_with_cache(self.current_frame_idx - 1)
+                    if prev_full is not None:
+                        prev_image = prev_full.crop((x1, y1, x2, y2))
+
+                # 計算 Diff（一般 ROI 使用通用二值化 RMSE）
+                diff_val = 0.0
+                if prev_image is not None:
+                    diff_val = self._calculate_general_roi_diff(prev_image, curr_roi_image)
+
+                # 更新右側對比圖（使用原本的預覽標籤）
+                try:
+                    if prev_image is not None and hasattr(self, 'stage_roi_preview_label') and self.stage_roi_preview_label:
+                        prev_resized = self._resize_roi_for_preview(prev_image, max_size=(200, 150))
+                        if prev_resized.mode != "RGB":
+                            prev_resized = prev_resized.convert("RGB")
+                        prev_photo = ImageTk.PhotoImage(prev_resized)
+                        self.stage_roi_preview_label.config(image=prev_photo)
+                        self.stage_roi_preview_label.image = prev_photo
+                except Exception as e:
+                    print(f"更新上一幀 ROI 預覽時出錯: {e}")
+
+                try:
+                    if hasattr(self, 'current_roi_preview_label') and self.current_roi_preview_label:
+                        curr_resized = self._resize_roi_for_preview(curr_roi_image, max_size=(200, 150))
+                        if curr_resized.mode != "RGB":
+                            curr_resized = curr_resized.convert("RGB")
+                        curr_photo = ImageTk.PhotoImage(curr_resized)
+                        self.current_roi_preview_label.config(image=curr_photo)
+                        self.current_roi_preview_label.image = curr_photo
+                except Exception as e:
+                    print(f"更新當前幀 ROI 預覽時出錯: {e}")
+
+                if hasattr(self, 'roi_diff_label') and self.roi_diff_label:
+                    self.roi_diff_label.config(text=f"OCR Diff: {diff_val:.4f} ({diff_val*100:.2f}%)")
+                return
+
+            # 手術階段模式：決定當前要處理的階段區域 (若未選擇則預設 PEDAL)
+            region_name = self.current_surgery_stage_region or "PEDAL"
+
+            if region_name not in self.surgery_stage_roi_dict:
+                return  # 該區域尚未設定 ROI
+
+            # 裁剪當前區域 ROI
+            region_coords = self.surgery_stage_roi_dict[region_name]
+            stage_roi_image = full_frame_pil.crop(tuple(region_coords))
+
+            # 計算roi_diff
+            roi_diff_value = 0.0
+            diff_matrix = None
+
+            # 取得上一幀同一區域的 ROI
+            prev_image = self.previous_stage_roi_images.get(region_name)
+            
+            # 如果沒有該區域的歷史圖像，嘗試從上一幀生成
+            if prev_image is None and hasattr(self, 'current_frame_idx') and self.current_frame_idx > 0:
+                prev_image = self._get_previous_frame_roi_for_region(region_name)
+
+            # 計算所有區域的 diff
+            if prev_image is not None:
+                if region_name == "PEDAL":
+                    # PEDAL 區域使用特殊的子區域diff計算
+                    roi_diff_value, diff_matrix = self._calculate_pedal_roi_diff(prev_image, stage_roi_image)
+                    print(f"PEDAL Diff: {roi_diff_value:.2f}")
+                    print(f"PEDAL Diff Matrix:\n{diff_matrix}")
+                else:
+                    # 其他區域使用通用的RMSE diff計算
+                    roi_diff_value = self._calculate_general_roi_diff(prev_image, stage_roi_image)
+                    diff_matrix = None
+
+            # 更新diff標籤
+            if hasattr(self, 'roi_diff_label') and self.roi_diff_label:
+                if prev_image is not None:
+                    if region_name == "PEDAL":
+                        # PEDAL使用RMSE差異，顯示原始數值
+                        self.roi_diff_label.config(text=f"{region_name} Diff: {roi_diff_value:.2f}")
+                    else:
+                        # 其他region使用像素差異比例，顯示比例和百分比
+                        self.roi_diff_label.config(text=f"{region_name} Diff: {roi_diff_value:.4f} ({roi_diff_value*100:.2f}%)")
+                else:
+                    self.roi_diff_label.config(text=f"{region_name} (No prev frame)")
+
+            # 顯示上一幀的ROI預覽（左側舊視圖仍維持）
+            try:
+                if prev_image is not None:
+                    last_preview_image = self._resize_roi_for_preview(prev_image, max_size=(200, 150))
+                    # Tkinter PhotoImage 需要確保 mode 為 RGB
+                    if last_preview_image.mode != "RGB":
+                        last_preview_image = last_preview_image.convert("RGB")
+                    last_preview_photo = ImageTk.PhotoImage(last_preview_image)
+                    if hasattr(self, 'stage_roi_preview_label') and self.stage_roi_preview_label:
+                        self.stage_roi_preview_label.config(image=last_preview_photo)
+                        self.stage_roi_preview_label.image = last_preview_photo
+            except Exception as e:
+                print(f"更新上一幀ROI預覽時出錯: {e}")
+                
+            # 顯示當前幀的ROI預覽（左側舊視圖仍維持）
+            try:
+                current_preview_image = self._resize_roi_for_preview(stage_roi_image, max_size=(200, 150))
+                # Tkinter PhotoImage 需要確保 mode 為 RGB
+                if current_preview_image.mode != "RGB":
+                    current_preview_image = current_preview_image.convert("RGB")
+                current_preview_photo = ImageTk.PhotoImage(current_preview_image)
+                if hasattr(self, 'current_roi_preview_label') and self.current_roi_preview_label:
+                    self.current_roi_preview_label.config(image=current_preview_photo)
+                    self.current_roi_preview_label.image = current_preview_photo
+            except Exception as e:
+                print(f"更新當前幀ROI預覽時出錯: {e}")
+
+
+
+            # 保存當前圖像作為下一次比較基準（僅手術階段模式）
+            self.previous_stage_roi_images[region_name] = stage_roi_image.copy()
+
+        except Exception as e:
+            print(f"更新STAGE ROI預覽時出錯: {e}")
+            traceback.print_exc()
+
+    def _resize_roi_for_preview(self, roi_image: Image.Image, max_size: tuple[int, int] = (200, 150)) -> Image.Image:
+        """調整ROI圖像大小以適應預覽區域，保持寬高比"""
+        try:
+            original_width, original_height = roi_image.size
+            max_width, max_height = max_size
+            
+            # 如果原圖已經很小，可以放大顯示
+            if original_width <= max_width and original_height <= max_height:
+                # 計算放大倍數，但不要過度放大
+                scale_x = max_width / original_width
+                scale_y = max_height / original_height
+                scale = min(scale_x, scale_y, 3.0)  # 最多放大3倍
+                
+                new_width = int(original_width * scale)
+                new_height = int(original_height * scale)
+            else:
+                # 計算縮放比例，保持寬高比
+                scale_x = max_width / original_width
+                scale_y = max_height / original_height
+                scale = min(scale_x, scale_y)
+                
+                new_width = int(original_width * scale)
+                new_height = int(original_height * scale)
+            
+            # 使用高質量重採樣
+            resized_image = roi_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            return resized_image
+            
+        except Exception as e:
+            print(f"調整ROI預覽大小時發生錯誤: {e}")
+            return roi_image  # 返回原圖
+
+    def _get_previous_frame_roi_for_region(self, region_name: str) -> Optional[Image.Image]:
+        """獲取指定區域在上一幀的ROI圖像"""
+        try:
+            if region_name not in self.surgery_stage_roi_dict:
+                return None
+                
+            # 獲取上一幀的完整圖像
+            prev_frame_idx = self.current_frame_idx - 1
+            if prev_frame_idx < 0:
+                return None
+                
+            prev_full_frame = self._get_full_frame_image_with_cache(prev_frame_idx)
+            if prev_full_frame is None:
+                return None
+                
+            # 裁剪該區域的ROI
+            region_coords = self.surgery_stage_roi_dict[region_name]
+            prev_roi_image = prev_full_frame.crop(tuple(region_coords))
+            
+            return prev_roi_image
+            
+        except Exception as e:
+            print(f"獲取上一幀ROI時發生錯誤: {e}")
+            return None
+
+    def _calculate_general_roi_diff(self, prev_img: Image.Image, curr_img: Image.Image) -> float:
+        """計算兩張ROI圖像的二值化像素差異比例（與surgery_analysis_process.py的calculate_binary_diff一致）"""
+        try:
+            # 對兩張圖像進行二值化處理（使用與core_processing.py一致的方法）
+            # 使用固定的rule方法參數，與surgery_analysis_process.py保持一致
+            prev_binary = self._apply_core_binarization(prev_img, "rule")
+            curr_binary = self._apply_core_binarization(curr_img, "rule")
+            
+            if prev_binary is None or curr_binary is None:
+                return 0.0
+            
+            # 轉換為numpy數組
+            if isinstance(prev_binary, np.ndarray):
+                prev_arr = prev_binary
+            else:
+                prev_arr = np.array(prev_binary)
+                
+            if isinstance(curr_binary, np.ndarray):
+                curr_arr = curr_binary
+            else:
+                curr_arr = np.array(curr_binary)
+            
+            # 檢查尺寸是否一致
+            if prev_arr.shape != curr_arr.shape:
+                return 0.0
+            
+            # 使用與surgery_analysis_process.py相同的計算方法
+            # 轉換為二值（0/1）
+            b1 = (prev_arr > 127).astype(np.uint8)
+            b2 = (curr_arr > 127).astype(np.uint8)
+            
+            # 計算XOR差異，返回差異像素的比例
+            diff = np.logical_xor(b1, b2)
+            return float(np.mean(diff))
+            
+        except Exception as e:
+            print(f"計算通用ROI diff時發生錯誤: {e}")
+            return 0.0
+
+    def _apply_core_binarization(self, image: Image.Image, method: str) -> Optional[np.ndarray]:
+        """應用與core_processing.py完全一致的二值化處理"""
+        try:
+            # 轉換為OpenCV格式 (BGR)
+            cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+            
+            if method == "otsu":
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                return binary
+            
+            elif method == "rule":
+                # 使用與core_processing.py完全相同的參數
+                hsv_s_thresh = 30
+                gray_thresh = 150
+                
+                hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+                h, s, v = cv2.split(hsv)
+                s_pct = (s / 255.0) * 100
+                mask = (s_pct < hsv_s_thresh) & (gray > gray_thresh)
+                binary = np.zeros_like(gray, dtype=np.uint8)
+                binary[mask] = 255
+                return binary
+            
+            else:
+                print(f"未支持的二值化方法: {method}")
+                return None
+                
+        except Exception as e:
+            print(f"core二值化處理失敗: {e}")
+            return None
+
+    def _calculate_pedal_roi_diff(self, prev_img: Image.Image, curr_img: Image.Image) -> tuple[float, np.ndarray | None]:
+        """計算兩張 PEDAL ROI 圖像在指定精細區域內的平均RGB顏色差異"""
+        try:
+            # 更新後的精細區域相對座標
+            sub_roi_coords = (20, 13, 26, 19) # x=19~26, y=13~19
+
+            # 從兩張圖像中裁剪出精細區域
+            prev_sub_roi = prev_img.crop(sub_roi_coords)
+            curr_sub_roi = curr_img.crop(sub_roi_coords)
+            
+            # 轉換為 NumPy 數組
+            prev_arr = np.array(prev_sub_roi).astype(np.float32)
+            curr_arr = np.array(curr_sub_roi).astype(np.float32)
+            
+            # 檢查尺寸是否一致
+            if prev_arr.shape != curr_arr.shape:
+                return 0.0, None
+            
+            # 計算每個像素RGB通道差值的平方
+            squared_diff = np.square(prev_arr - curr_arr)
+            
+            # 計算每個像素的均方差 (MSE)
+            mse_per_pixel = np.mean(squared_diff, axis=2)
+            
+            # 計算每個像素的均方根差 (RMSE)，即顏色距離
+            rmse_per_pixel = np.sqrt(mse_per_pixel)
+            average_rmse = float(np.mean(rmse_per_pixel))
+            
+            # --- 增加調試輸出 ---
+            rmse_list = rmse_per_pixel.flatten().tolist()
+            rmse_str_list = [f"{val:.2f}" for val in rmse_list]
+            print(f"Frame {self.current_frame_idx} - PEDAL Diff Avg: {average_rmse:.2f}, (RMSE per pixel): {rmse_str_list}")
+            
+            # 返回所有像素顏色距離的平均值和完整的差異矩陣
+            return average_rmse, rmse_per_pixel
+            
+        except Exception as e:
+            print(f"計算 roi_diff 時出錯: {e}")
+            return 0.0, None
+
+    def _get_full_frame_image_with_cache(self, frame_idx: int) -> Optional[Image.Image]:
+        """
+        獲取單個完整幀的PIL圖像，實現了磁碟快取機制。
+        1. 優先從 `data/<video_name>/frame_cache/frame_{frame_idx}.jpg` 讀取。
+        2. 如果快取不存在，則從 `self.cap_ui` 讀取。
+        3. 從影片讀取成功後，立刻將其寫入快取資料夾以備後用。
+        """
+        cache_dir = self._get_frame_cache_dir()
+        if not cache_dir:
+            print("錯誤: 無法獲取快取目錄")
+            return None # 無法獲取快取目錄，直接返回
+
+        cached_frame_path = cache_dir / f"frame_{frame_idx}.jpg"
+
+        # 1. 嘗試從快取讀取
+        if cached_frame_path.exists():
+            try:
+                return Image.open(cached_frame_path)
+            except Exception as e:
+                print(f"警告: 快取檔案 {cached_frame_path} 損壞，將重新生成: {e}")
+
+        # 2. 快取不存在，從影片讀取 (Fallback)
+        if not self.cap_ui or not self.cap_ui.isOpened():
+            print(f"錯誤: UI VideoCapture 未開啟，無法讀取幀 {frame_idx}")
+            return None
+        
+        self.cap_ui.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame_bgr = self.cap_ui.read()
+
+        if not ret:
+            print(f"警告：從影片讀取幀 {frame_idx} 失敗")
+            return None
+        
+        # 轉換為PIL圖像
+        frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        
+        # 3. 寫入快取
+        try:
+            # 使用中等品質(85)的JPEG儲存，以平衡品質和檔案大小
+            frame_pil.save(cached_frame_path, "JPEG", quality=85)
+        except Exception as e:
+            print(f"警告: 無法寫入快取檔案 {cached_frame_path}: {e}")
+            
+        return frame_pil
 
     def _canvas_to_video_coords(self, canvas_x: int, canvas_y: int) -> tuple[int, int]:
         """
@@ -2320,13 +2491,32 @@ class VideoAnnotator(tk.Frame):
     
     def _on_roi_start(self, event):
         """Records the starting coordinates for ROI selection."""
-        video_x, video_y = self._canvas_to_video_coords(event.x, event.y)
-        self.roi_start_coords = (video_x, video_y)
-        # self.roi_start_coords = (event.x, event.y)
-        # Optional: Delete existing temporary drag rectangle if using Canvas
+        if self.surgery_stage_mode:
+            self._on_surgery_stage_roi_start(event)
+        else:
+            self._on_ocr_roi_start(event)
 
     def _on_roi_drag(self, event):
         """Draws a temporary rectangle while dragging."""
+        if self.surgery_stage_mode:
+            self._on_surgery_stage_roi_drag(event)
+        else:
+            self._on_ocr_roi_drag(event)
+
+    def _on_roi_end(self, event):
+        """Handles ROI selection completion."""
+        if self.surgery_stage_mode:
+            self._on_surgery_stage_roi_end(event)
+        else:
+            self._on_ocr_roi_end(event)
+
+    def _on_ocr_roi_start(self, event):
+        """Records the starting coordinates for OCR ROI selection."""
+        video_x, video_y = self._canvas_to_video_coords(event.x, event.y)
+        self.roi_start_coords = (video_x, video_y)
+
+    def _on_ocr_roi_drag(self, event):
+        """Draws a temporary rectangle while dragging for OCR ROI."""
         if not self.roi_start_coords:
             return
 
@@ -2337,14 +2527,11 @@ class VideoAnnotator(tk.Frame):
         # If using Canvas:
         # if self.roi_rect_id: self.lbl_video.delete(self.roi_rect_id)
         # self.roi_rect_id = self.lbl_video.create_rectangle(x1, y1, x2, y2, outline="blue", width=1, tags="roi_rect")
-
-        # --- 如果是 Label (無法直接繪製): ---
-        # 拖動時的實時反饋比較困難，可以考慮只在釋放時更新最終矩形
         pass # No easy way to draw temporary rect on Label without redrawing image constantly
 
-    def _on_roi_end(self, event):
+    def _on_ocr_roi_end(self, event):
         """
-        使用者在畫面上拖曳完 ROI 框後呼叫：
+        使用者在畫面上拖曳完 OCR ROI 框後呼叫：
         1. 儲存新的 ROI 座標
         2. 清空與 ROI 相關的快取與欄位
         3. 重新啟動背景分析執行緒
@@ -2371,7 +2558,7 @@ class VideoAnnotator(tk.Frame):
         self.roi_start_coords = None
 
         if (x2 - x1) < 5 or (y2 - y1) < 5:
-            print("ROI 太小，已忽略。")
+            print("OCR ROI 太小，已忽略。")
             self._show_frame(self.current_frame_idx)
             return
 
@@ -2381,26 +2568,16 @@ class VideoAnnotator(tk.Frame):
             self.roi_dict[self.region_name] = list(self.roi_coords)
             
             # 拖曳ROI後，詢問是否要儲存
-            result = messagebox.askyesno("儲存設定", f"ROI區域已更新，是否儲存到配置檔案？")
+            result = messagebox.askyesno("儲存設定", f"OCR ROI區域已更新，是否儲存到配置檔案？")
             if result:
                 self._save_roi_config()
 
             # 清空快取
             self.change_cache.clear()
-            self.ocr_cache.clear()
-            self.roi_image_cache.clear()
-
-            # 停止並重啟分析
-            self.stop_event.set()
-            for th_name in ["analysis_thread", "ocr_thread"]:
-                th = getattr(self, th_name, None)
-                if th and th.is_alive():
-                    th.join(timeout=1.0)
-            self.stop_event.clear()
 
             # 更新UI
             self._update_roi_fields()
-            status_msg = f"{self.region_name} ROI 更新: {self.roi_coords}"
+            status_msg = f"{self.region_name} OCR ROI 更新: {self.roi_coords}"
             if result:
                 status_msg += " (已儲存)"
             else:
@@ -2409,33 +2586,74 @@ class VideoAnnotator(tk.Frame):
         
         self._show_frame(self.current_frame_idx)
 
-    def _normalize_roi_coords(self, end_x: int, end_y: int) -> tuple[int, int, int, int]: # 參數改為 canvas 座標
-        """
-        依照拖曳起點 (self.roi_start_coords，已是原始影片座標) 與結束的 canvas 座標 (end_x,end_y)，
-        轉回影片原尺寸座標 (x1,y1,x2,y2)，並裁切在有效範圍內。
-        """
-        if self.roi_start_coords is None: # 防呆
-            # 如果沒有起點，嘗試將結束點作為一個小範圍的中心 (或直接返回錯誤/預設)
-            # 這裡假設不應該發生，因為 _on_roi_end 會先檢查
-            print("警告: _normalize_roi_coords 被呼叫時 roi_start_coords 為 None")
-            # 安全起見，返回一個無效或預設的 ROI
-            return 0,0,0,0
+    def _on_surgery_stage_roi_start(self, event):
+        """Records the starting coordinates for surgery stage ROI selection."""
+        video_x, video_y = self._canvas_to_video_coords(event.x, event.y)
+        self.surgery_stage_roi_start_coords = (video_x, video_y)
 
+    def _on_surgery_stage_roi_drag(self, event):
+        """Draws a temporary rectangle while dragging for surgery stage ROI."""
+        if not hasattr(self, 'surgery_stage_roi_start_coords') or not self.surgery_stage_roi_start_coords:
+            return
+        pass # No easy way to draw temporary rect on Label without redrawing image constantly
 
-        start_x_orig, start_y_orig = self.roi_start_coords
-        end_x_orig, end_y_orig = self._canvas_to_video_coords(end_x, end_y) # 將 canvas 座標轉為影片座標
+    def _on_surgery_stage_roi_end(self, event):
+        """
+        使用者在畫面上拖曳完手術階段ROI框後呼叫
+        """
+        if not hasattr(self, 'surgery_stage_roi_start_coords') or self.surgery_stage_roi_start_coords is None:
+            self._show_frame(self.current_frame_idx)
+            return
+
+        if not self.current_surgery_stage_region:
+            messagebox.showwarning("警告", "請先選擇手術階段區域")
+            self.surgery_stage_roi_start_coords = None
+            self._show_frame(self.current_frame_idx)
+            return
+
+        # 計算並驗證ROI座標
+        start_x_orig, start_y_orig = self.surgery_stage_roi_start_coords
+        end_x_orig, end_y_orig = self._canvas_to_video_coords(event.x, event.y)
 
         x1 = min(start_x_orig, end_x_orig)
         y1 = min(start_y_orig, end_y_orig)
         x2 = max(start_x_orig, end_x_orig)
         y2 = max(start_y_orig, end_y_orig)
 
-        # 邊界檢查 (雖然 _canvas_to_video_coords 應該已經處理了)
         x1 = max(0, min(x1, self.original_vid_w - 1))
         y1 = max(0, min(y1, self.original_vid_h - 1))
         x2 = max(0, min(x2, self.original_vid_w - 1))
         y2 = max(0, min(y2, self.original_vid_h - 1))
-        return x1, y1, x2, y2
+
+        new_roi = (x1, y1, x2, y2)
+        self.surgery_stage_roi_start_coords = None
+
+        if (x2 - x1) < 5 or (y2 - y1) < 5:
+            print("手術階段ROI 太小，已忽略。")
+            self._show_frame(self.current_frame_idx)
+            return
+
+        # 儲存手術階段ROI變更
+        old_roi = self.surgery_stage_roi_dict.get(self.current_surgery_stage_region)
+        if list(new_roi) != old_roi:
+            self.surgery_stage_roi_dict[self.current_surgery_stage_region] = list(new_roi)
+            
+            # 更新手術階段ROI座標顯示
+            self._update_surgery_stage_roi_fields()
+            
+            # 拖曳ROI後，詢問是否要儲存
+            result = messagebox.askyesno("儲存設定", f"手術階段ROI區域已更新，是否儲存到配置檔案？")
+            if result:
+                self._save_surgery_stage_roi_config()
+
+            status_msg = f"{self.current_surgery_stage_region} 手術階段ROI 更新: {new_roi}"
+            if result:
+                status_msg += " (已儲存)"
+            else:
+                status_msg += " (未儲存)"
+            self._update_status_bar(status_msg)
+        
+        self._show_frame(self.current_frame_idx)
 
     def _crop_roi(self, frame_pil_full: Image.Image) -> Optional[Image.Image]:
         """從完整幀中裁切 ROI 區域"""
@@ -2457,58 +2675,6 @@ class VideoAnnotator(tk.Frame):
             print(f"裁剪 ROI 時出錯: {e}")
             return None
 
-    def _on_tree_double_click(self, event):
-        """雙擊 content 欄 → 執行 EasyOCR，並回填結果。"""
-        item = self.tree.identify_row(event.y)
-        column = self.tree.identify_column(event.x)
-        if not item or column != "#2":      # 只限 content 欄 (#2)
-            return
-        frame_idx = int(self.tree.set(item, "frame"))
-
-        # 取 ROI 圖
-        roi_pil = self.roi_image_cache.get(frame_idx)
-        if roi_pil is None:
-            roi_pil = self._load_roi_from_file(frame_idx)
-        if roi_pil is None:
-            messagebox.showerror("錯誤", f"讀不到 frame {frame_idx} 的 ROI 圖。")
-            return
-
-        # 直接呼叫 reader，拿完整 (bbox, text, conf)
-        results = self.ocr_iface.reader.readtext(
-            np.array(roi_pil),
-            allowlist="0123456789-",
-            detail=1, paragraph=False
-        )
-        print(f"[OCR] frame {frame_idx}:")
-        for (bbox, txt, conf) in results:
-            keep = conf >= self.OCR_CONF_TH
-            flag = "✔" if keep else "✖"
-            x_pos = bbox[0][0]  # 左上角 x 座標
-            print(f"  {flag} '{txt}'  pos={x_pos:.1f}  conf={conf:.2f}")
-        
-        # 按座標排序後才組合文字
-        filtered = [(txt, bbox[0][0]) for (bbox, txt, conf) in results 
-                    if conf >= self.OCR_CONF_TH]
-        filtered.sort(key=lambda x: x[1])  # 按 x 座標排序
-        joined_txt = " ".join(item[0] for item in filtered)
-
-        # 彈出可編輯 Entry
-        x, y, w, h = self.tree.bbox(item, column)
-        edit_win = tk.Toplevel(self)
-        edit_win.overrideredirect(True)
-        edit_win.geometry(f"{w}x{h}+{self.winfo_rootx()+x}+{self.winfo_rooty()+y}")
-        entry = tk.Entry(edit_win)
-        entry.insert(0, joined_txt)
-        entry.select_range(0, tk.END)
-        entry.focus()
-        entry.pack(fill="both", expand=True)
-
-        def _save_edit(e=None):
-            self.tree.set(item, "content", entry.get())
-            edit_win.destroy()
-        entry.bind("<Return>", _save_edit)
-        entry.bind("<Escape>", lambda e: edit_win.destroy())
-
     def _step_frame(self, delta: int):
         """切換到相對當前幀的指定偏移幀 - 單純的幀切換"""
         if self.total_frames == 0:
@@ -2529,98 +2695,6 @@ class VideoAnnotator(tk.Frame):
                 print("已到達最後一幀")
             elif delta < 0 and new_idx == 0:
                 print("已到達第一幀")
-
-    def _jump_to_previous_change(self):
-        """跳轉到前一個變化幀"""
-        if not self.change_cache:
-            print("沒有變化幀資料")
-            messagebox.showinfo("提示", "沒有變化幀資料，請先進行分析")
-            return
-        
-        # 獲取所有變化幀，按幀號排序
-        change_frames = sorted([frame for frame, has_change in self.change_cache.items() if has_change])
-        
-        if not change_frames:
-            print("沒有檢測到變化幀")
-            messagebox.showinfo("提示", "沒有檢測到變化幀")
-            return
-        
-        current_frame = self.current_frame_idx
-        
-        # 找到當前幀之前的最後一個變化幀
-        previous_change = None
-        for frame in reversed(change_frames):
-            if frame < current_frame:
-                previous_change = frame
-                break
-        
-        if previous_change is not None:
-            print(f"跳轉到前一個變化幀: {current_frame} -> {previous_change}")
-            self._show_frame(previous_change)
-            self._highlight_treeview_item(previous_change)
-        else:
-            # 如果沒有更早的變化幀，跳到最後一個變化幀（循環）
-            if change_frames:
-                last_change = change_frames[-1]
-                print(f"沒有更早的變化幀，跳轉到最後一個變化幀: {current_frame} -> {last_change}")
-                self._show_frame(last_change)
-                self._highlight_treeview_item(last_change)
-            else:
-                print("沒有更早的變化幀")
-
-    def _jump_to_next_change(self):
-        """跳轉到後一個變化幀"""
-        if not self.change_cache:
-            print("沒有變化幀資料")
-            messagebox.showinfo("提示", "沒有變化幀資料，請先進行分析")
-            return
-        
-        # 獲取所有變化幀，按幀號排序
-        change_frames = sorted([frame for frame, has_change in self.change_cache.items() if has_change])
-        
-        if not change_frames:
-            print("沒有檢測到變化幀")
-            messagebox.showinfo("提示", "沒有檢測到變化幀")
-            return
-        
-        current_frame = self.current_frame_idx
-        
-        # 找到當前幀之後的第一個變化幀
-        next_change = None
-        for frame in change_frames:
-            if frame > current_frame:
-                next_change = frame
-                break
-        
-        if next_change is not None:
-            print(f"跳轉到後一個變化幀: {current_frame} -> {next_change}")
-            self._show_frame(next_change)
-            self._highlight_treeview_item(next_change)
-        else:
-            # 如果沒有更晚的變化幀，跳到第一個變化幀（循環）
-            if change_frames:
-                first_change = change_frames[0]
-                print(f"沒有更晚的變化幀，跳轉到第一個變化幀: {current_frame} -> {first_change}")
-                self._show_frame(first_change)
-                self._highlight_treeview_item(first_change)
-            else:
-                print("沒有更晚的變化幀")
-
-    def _highlight_treeview_item(self, frame_idx: int):
-        """在TreeView中高亮顯示指定幀的項目"""
-        try:
-            # 查找對應的TreeView項目
-            for item in self.tree.get_children():
-                item_frame = int(self.tree.set(item, "frame"))
-                if item_frame == frame_idx:
-                    # 選中並確保可見
-                    self.tree.selection_set(item)
-                    self.tree.see(item)
-                    print(f"在TreeView中高亮顯示幀 {frame_idx}")
-                    return
-            print(f"在TreeView中找不到幀 {frame_idx}")
-        except Exception as e:
-            print(f"高亮TreeView項目時出錯: {e}")
 
     def _on_slider_move(self, value):
         """
@@ -2644,155 +2718,7 @@ class VideoAnnotator(tk.Frame):
             return
         idx = int(float(self.slider_var.get()))
         self._show_frame(idx)  # 會自動更新 lbl_frame_num
-
-    def _preload_frames(self, n_frames: int = 150):
-        """
-        將前 n_frames 幀讀出並放入 detect_queue，
-        以便背景 T‑MAD/ OCR 能提早開始運算。
-        若想完全停用此機能，可將函式留空或直接 return。
-        """
-        if not self.cap_detect or not self.cap_detect.isOpened():
-            return
-        # 從頭開始讀
-        self.cap_detect.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        for f_idx in range(min(n_frames, self.total_frames)):
-            ret, f_bgr = self.cap_detect.read()
-            if not ret:
-                break
-            f_pil = Image.fromarray(cv2.cvtColor(f_bgr, cv2.COLOR_BGR2RGB))
-            try:
-                self.detect_queue.put_nowait((f_idx, f_pil))
-            except queue.Full:
-                break
-        # 不改變 UI VideoCapture (self.cap_ui) 的當前位置
-
-    def _fill_and_get_records(self, tree_items: list) -> list:
-        """
-        接收 TreeView 的項目列表，填充缺失的幀，並返回包含所有連續幀記錄的完整列表。
-        """
-        if not tree_items:
-            return []
-        if not self.video_file_path: # 需要影片名稱來建構 image 路徑
-            print("錯誤：無法填充記錄，因為影片路徑未設定。")
-            return []
-
-        video_name = self.video_file_path.stem
-        records_by_frame = {}
-        min_frame = float('inf')
-        max_frame = float('-inf')
-
-        # 1. 從 TreeView 項目中提取數據
-        print("正在從 TreeView 提取標註...")
-        for iid in tree_items:
-            item_data = self.tree.item(iid)
-            values = item_data.get("values", [])
-            if not values or len(values) < 2:
-                print(f"警告：跳過 TreeView 中格式不符的項目 {iid}")
-                continue
-            try:
-                frame_idx = int(values[0])
-                # 直接儲存 response 字串
-                response_text = str(values[1]) if values[1] is not None else ""
-                records_by_frame[frame_idx] = response_text
-                min_frame = min(min_frame, frame_idx)
-                max_frame = max(max_frame, frame_idx)
-            except (ValueError, IndexError) as e:
-                print(f"警告：解析 TreeView 項目 {iid} 時出錯 ({e})，已跳過")
-                continue
-
-        if not records_by_frame:
-            print("資訊：TreeView 中沒有有效的標註可供填充。")
-            return []
-
-        # 檢查是否有有效的幀範圍
-        if min_frame == float('inf') or max_frame == float('-inf'):
-             print("錯誤：無法從 TreeView 確定有效的幀範圍。")
-             return []
-
-        print(f"從 TreeView 提取記錄範圍：幀 {min_frame} 到 {max_frame}")
-
-        filled_records = []
-        last_known_response = "" # 初始值
-
-        print(f"正在填充從 {min_frame} 到 {max_frame} 的所有幀...")
-        # 確保按幀號順序處理原始記錄
-        sorted_original_frames = sorted(records_by_frame.keys())
-        original_record_idx = 0
-
-        for current_frame in range(min_frame, max_frame + 1):
-            # 檢查原始記錄中是否有當前幀
-            if original_record_idx < len(sorted_original_frames) and sorted_original_frames[original_record_idx] == current_frame:
-                # 使用原始記錄 (來自 TreeView)
-                response = records_by_frame[current_frame]
-                last_known_response = response # 更新最後已知的 response
-                region_name = getattr(self, "region_name", "region2")  # 預設為 "region2"
-                image_path = f"{video_name}/{region_name}/frame_{current_frame}.png"
-                record = {
-                    "query": "<image>",
-                    "response": response,
-                    "images": image_path
-                }
-                filled_records.append(record)
-                original_record_idx += 1
-            else:
-                # 填充缺失的幀
-                image_path = f"{video_name}/region2/frame_{current_frame}.png"
-                new_record = {
-                    "query": "<image>",
-                    "response": last_known_response, # 使用上一個已知幀的 response
-                    "images": image_path
-                }
-                filled_records.append(new_record)
-
-        print(f"填充完成，總共 {len(filled_records)} 筆記錄。")
-        return filled_records
-
-    def _save_to_file(self, file_path: Path):
-        """Internal function to save data to the specified JSONL file."""
-        print(f"準備儲存標註到: {file_path}")
-        results_to_save = []
-        # Combine annotations, OCR cache, and change cache
-        all_frames = set(self.annotations.keys()) | set(self.ocr_cache.keys()) | set(self.change_cache.keys())
-        if not all_frames and self.total_frames > 0: # If caches are empty but video loaded, save frame numbers
-             all_frames = set(range(self.total_frames))
-
-        for i in sorted(list(all_frames)):
-            # Ensure annotation exists, default to OCR result if annotation is empty/None
-            annotation_val = self.annotations.get(i)
-            ocr_val = self.ocr_cache.get(i, "")
-            final_annotation = annotation_val if annotation_val is not None else ocr_val # Prefer explicit annotation
-
-            record = {
-                "frame": i,
-                "changed": self.change_cache.get(i, None), # Include change status if available
-                "ocr_text": ocr_val,
-                "annotation": final_annotation # Use combined annotation
-            }
-            results_to_save.append(record)
-
-        if not results_to_save:
-             print("沒有可儲存的數據。")
-             # messagebox.showinfo("無需儲存", "沒有檢測到標註或處理結果需要儲存。")
-             self.lbl_status.config(text="無數據可儲存")
-             return
-
-        try:
-            with self.save_lock: # Use lock for file writing
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    for record in results_to_save:
-                        json.dump(record, f, ensure_ascii=False)
-                        f.write('\n')
-            # Don't show messagebox here, let the caller (_save_annotations) handle it
-            print(f"成功儲存 {len(results_to_save)} 條記錄到 {file_path}")
-            # self.lbl_status.config(text="儲存成功") # Status updated in _save_annotations
-        except IOError as e:
-            messagebox.showerror("儲存失敗", f"無法寫入文件:\n{file_path}\n錯誤: {e}")
-            print(f"儲存失敗: {e}")
-            self.lbl_status.config(text="儲存失敗")
-        except Exception as e:
-            messagebox.showerror("儲存失敗", f"儲存過程中發生未知錯誤: {e}")
-            print(f"儲存時發生未知錯誤: {e}")
-            self.lbl_status.config(text="儲存失敗")
+        # slider 更新後，標籤不需要重繪，位置與時間軸一致
 
     def _load_annotations(self, region: str):
         """載入指定 region 的標註到 self.annotations"""
@@ -2852,16 +2778,73 @@ class VideoAnnotator(tk.Frame):
         else:
             print(f"標註檔案不存在: {path}")
 
+    def _configure_treeview_columns(self, mode: str, region: str = None):
+        """動態配置TreeView的欄位"""
+        try:
+            if mode == "ocr":
+                # OCR模式：只需要幀號和標註內容
+                columns = ("frame", "content")
+                self.tree.config(columns=columns)
+                self.tree.heading("frame", text="幀號")
+                self.tree.heading("content", text="標註內容")
+                self.tree.column("frame", width=frame_width, anchor="center")
+                self.tree.column("content", width=content_width, anchor="center")
+                
+            elif mode == "surgery_stage":
+                if region == "STAGE":
+                    # STAGE區域：起始幀、模式類型、結束幀、IOP、Asp、Vac
+                    columns = ("frame", "content", "end_frame", "iop", "asp", "vac")
+                    self.tree.config(columns=columns)
+                    self.tree.heading("frame", text="起始幀")
+                    self.tree.heading("content", text="模式類型")
+                    self.tree.heading("end_frame", text="結束幀")
+                    self.tree.heading("iop", text="IOP")
+                    self.tree.heading("asp", text="Asp")
+                    self.tree.heading("vac", text="Vac")
+                    self.tree.column("frame", width=frame_width, anchor="center")
+                    self.tree.column("content", width=content_width, anchor="center")
+                    self.tree.column("end_frame", width=end_frame_width, anchor="center")
+                    self.tree.column("iop", width=iop_width, anchor="center")
+                    self.tree.column("asp", width=asp_width, anchor="center")
+                    self.tree.column("vac", width=vac_width, anchor="center")
+                else:
+                    # PEDAL或其他區域：起始幀、模式類型、結束幀
+                    columns = ("frame", "content", "end_frame")
+                    self.tree.config(columns=columns)
+                    self.tree.heading("frame", text="起始幀")
+                    self.tree.heading("content", text="模式類型")
+                    self.tree.heading("end_frame", text="結束幀")
+                    self.tree.column("frame", width=frame_width, anchor="center")
+                    self.tree.column("content", width=content_width, anchor="center")
+                    self.tree.column("end_frame", width=end_frame_width, anchor="center")
+                    
+        except Exception as e:
+            print(f"配置TreeView欄位時出錯: {e}")
+
     def _refresh_treeview(self):
-        """重新載入標註檔案並顯示在 Treeview 中"""
+        """根據當前模式重新載入表格內容"""
         # 清空現有表格
         for item in self.tree.get_children():
             self.tree.delete(item)
         
+        if self.surgery_stage_mode:
+            # 手術階段分析模式
+            current_region = getattr(self, 'current_surgery_stage_region', None)
+            self._configure_treeview_columns("surgery_stage", current_region)
+            self._load_stage_analysis_to_treeview()
+        else:
+            # OCR標註模式
+            self._configure_treeview_columns("ocr")
+            self._load_ocr_annotations_to_treeview()
+
+    def _load_ocr_annotations_to_treeview(self):
+        """載入OCR標註到表格"""
+        if not (self.video_file_path and self.region_name):
+            return
+            
         # 載入標註檔案
-        if self.video_file_path and self.region_name:
-            self._load_annotations(self.region_name)
-            self._load_change_frames(self.region_name)
+        self._load_annotations(self.region_name)
+        self._load_change_frames(self.region_name)
         
         # 如果變化幀為空但標註存在，從標註推導變化幀
         if not any(self.change_cache.values()) and self.annotations:
@@ -2874,658 +2857,307 @@ class VideoAnnotator(tk.Frame):
         
         for frame_idx in change_frames:
             # 取得標註內容
-            content = self.annotations.get(frame_idx, "")
+            ocr_value = self.annotations.get(frame_idx, "")
             
-            # 先插入項目，Diff 欄位暫時顯示 "計算中..."
             item_id_str = f"F{frame_idx}"
             self.tree.insert("", "end", iid=item_id_str, 
-                            values=(frame_idx, "計算中...", content, ""))
-            
-            # 應用 "changed" 標籤
-            self.tree.item(item_id_str, tags=("changed",))
-        
-        # # 逐步計算 Diff 值
-        # if change_frames:
-        #     self._calculate_diffs_gradually(change_frames)
+                            values=(frame_idx, ocr_value))
 
-    def _calculate_diffs_gradually(self, change_frames: List[int]):
-        """逐步計算 Diff 值，不卡住 UI"""
-        def process_one_frame(index):
-            if index >= len(change_frames):
-                print(f"Diff 計算完成，共處理 {len(change_frames)} 個變化幀")
-                return  # 完成
-            
-            frame_idx = change_frames[index]
-            item_id_str = f"F{frame_idx}"
-            
-            if self.tree.exists(item_id_str):
-                # 計算 diff 值
-                diff_value = self._calculate_frame_diff(frame_idx)
-                
-                # 更新 Diff 欄位
-                self.tree.set(item_id_str, "diff", diff_value)
-                
-                # 如果 diff < 0.01，加上紅字 tag
-                current_tags = list(self.tree.item(item_id_str, "tags"))
-                if diff_value != "-" and float(diff_value) < 0.01:
-                    if "small_diff" not in current_tags:
-                        current_tags.append("small_diff")
-                else:
-                    if "small_diff" in current_tags:
-                        current_tags.remove("small_diff")
-                self.tree.item(item_id_str, tags=tuple(current_tags))
-            
-            # 繼續處理下一個 frame
-            self.after(10, lambda: process_one_frame(index + 1))
-        
-        # 開始處理
-        print(f"開始逐步計算 {len(change_frames)} 個變化幀的 Diff 值...")
-        process_one_frame(0)
-
-    def _start_background_threads(self):
-        """啟動背景分析執行緒"""
-        if not self.video_file_path or not self.roi_coords:
-            print("無法啟動背景執行緒：影片或 ROI 未設定")
-            return
-            
-        # 停止現有執行緒
-        self.stop_event.set()
-        for th_name in ["analysis_thread", "ocr_thread"]:
-            thread = getattr(self, th_name, None)
-            if thread and thread.is_alive():
-                thread.join(timeout=1.0)
-        self.stop_event.clear()
-        
-        # 清空隊列
-        for q in [self.detect_queue, self.ocr_queue, self.result_queue]:
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
-        
-        # 啟動新執行緒
+    def _get_ocr_text_at_frame(self, region_name: str, target_frame: int) -> str:
+        """根據frame推算指定region的OCR內容（使用緩存）"""
         try:
-            self.analysis_thread = threading.Thread(
-                target=self._analysis_worker,
-                daemon=True,
-                name="AnalysisThread"
-            )
-            self.ocr_thread = threading.Thread(
-                target=self._ocr_worker,
-                daemon=True,
-                name="OCRThread"
-            )
+            # 優先使用緩存
+            if region_name in self.ocr_cache:
+                frame_to_ocr = self.ocr_cache[region_name]
+                
+                # 如果直接找到該frame的OCR
+                if target_frame in frame_to_ocr:
+                    return frame_to_ocr[target_frame]
+                
+                # 如果沒有直接找到，找最近的前一個有OCR的frame
+                sorted_frames = sorted(frame_to_ocr.keys())
+                for i in range(len(sorted_frames) - 1, -1, -1):
+                    if sorted_frames[i] <= target_frame:
+                        return frame_to_ocr[sorted_frames[i]]
+                
+                return ""
             
-            self.analysis_thread.start()
-            self.ocr_thread.start()
+            # 如果緩存中沒有，嘗試即時載入（fallback）
+            if not self.video_file_path:
+                return ""
             
-            print("背景分析執行緒已啟動")
-            self._update_status_bar("背景分析已啟動")
+            ocr_path = Path("data") / self.video_title / f"{region_name}_ocr_testing.jsonl"
+            if not ocr_path.exists():
+                print(f"OCR檔案不存在: {ocr_path}")
+                return ""
             
-        except Exception as e:
-            print(f"啟動背景執行緒失敗: {e}")
-            self._update_status_bar(f"啟動分析失敗: {e}")
-
-
-    def _detect_frame_change(self, frame_idx: int, video_capture_for_roi: cv2.VideoCapture, 
-                           tmad_threshold: float, diff_threshold: int) -> bool:
-        """
-        偵測指定幀是否有變化 - 使用 PIL 圖像和 T-MAD。
-        tmad_threshold 和 diff_threshold 作為參數傳入。
-        """
-        try:
-            if not video_capture_for_roi or not video_capture_for_roi.isOpened():
-                print(f"錯誤: _detect_frame_change 的 video_capture_for_roi 無效 (frame {frame_idx})")
-                return False 
-
-            if frame_idx == 0:
-                # For the first frame, always consider it changed and cache its ROI
-                first_frame_roi = self._get_roi_image(frame_idx, video_capture_for_roi)
-                if first_frame_roi is None: 
-                    print(f"警告: 無法為第一幀 {frame_idx} 獲取ROI圖像。")
-                    # Consider returning True to flag it, or False if ROI is critical for subsequent steps.
-                    # If first frame ROI is essential for OCR, returning True allows OCR attempt.
-                    return True 
-                self.roi_image_cache[frame_idx] = first_frame_roi
-                return True
+            print(f"警告：{region_name} 未在緩存中，進行即時載入")
             
-            curr_roi = self._get_roi_image(frame_idx, video_capture_for_roi)
-            # Try to get previous ROI from cache first
-            prev_roi = self.roi_image_cache.get(frame_idx - 1)
-            # If not in cache, get it from video capture (this might be redundant if _get_roi_image handles caching well)
-            if prev_roi is None:
-                prev_roi = self._get_roi_image(frame_idx - 1, video_capture_for_roi)
-            
-            if curr_roi is None or prev_roi is None:
-                print(f"無法取得幀 {frame_idx} 或 {frame_idx-1} 的 ROI 圖像進行變化偵測")
-                # Mark as change if ROIs are not available, to allow OCR attempt or manual check
-                return True 
-            
-            # 使用傳入的閾值
-            has_change = self.change_iface.is_changed(
-                prev_roi, curr_roi, 
-                tmad_threshold=tmad_threshold, # 使用傳入的 tmad_threshold
-                diff_threshold=diff_threshold  # 使用傳入的 diff_threshold
-            )
-            return has_change
-            
-        except Exception as e:
-            print(f"變化偵測錯誤 (frame {frame_idx}): {e}")
-            traceback.print_exc()
-            return False # 保守返回 False
-
-    def _detect_frame_change2(self, frame_idx, video_capture_for_roi):
-        """二值化後diff值超過0.01視為有變化"""
-        if frame_idx == 0:
-            return False
-        roi_img1 = self._get_roi_image(frame_idx - 1, video_capture_for_roi)
-        roi_img2 = self._get_roi_image(frame_idx, video_capture_for_roi)
-        if roi_img1 and roi_img2:
-            bin_method = self.binarize_method_var.get()
-            bin1 = self._apply_binarization(roi_img1, bin_method)
-            bin2 = self._apply_binarization(roi_img2, bin_method)
-            if bin1 and bin2:
-                arr1 = np.array(bin1.convert("L"))
-                arr2 = np.array(bin2.convert("L"))
-                diff = self._calculate_binary_diff(arr1, arr2)
-                return diff > 0.01
-        return False
-    
-        # --- 顯示 diff 值與變化判定 ---
-        # diff_text = "Diff: -"
-        # if frame_idx > 0:
-        #     roi_img1 = self._get_roi_image(frame_idx - 1, self.cap_ui)
-        #     roi_img2 = self._get_roi_image(frame_idx, self.cap_ui)
-        #     if roi_img1 and roi_img2:
-        #         bin_method = self.binarize_method_var.get()
-        #         bin1 = self._apply_binarization(roi_img1, bin_method)
-        #         bin2 = self._apply_binarization(roi_img2, bin_method)
-        #         if bin1 and bin2:
-        #             arr1 = np.array(bin1.convert("L"))
-        #             arr2 = np.array(bin2.convert("L"))
-        #             diff = self._calculate_binary_diff(arr1, arr2)
-        #             diff_text = f"Diff: {diff:.4f}"
-        # self.lbl_diff.config(text=diff_text)
-
-
-    def _get_next_unanalyzed_frame(self) -> Optional[int]:
-        """取得下一個未分析的幀"""
-        for i in range(self.total_frames):
-            if i not in self.change_cache:
-                return i
-        return None
-
-    def _show_compare_roi_on_canvas(self, canvas, frame_idx, result_dict, show_new=True):
-        roi_img = self._get_roi_image(frame_idx, self.cap_ui)
-        if roi_img is None:
-            canvas.delete("all")
-            return
-        # 這裡可根據 show_new 決定是否要二值化
-        if show_new and result_dict.get(frame_idx, False):
-            bin_img = self._apply_binarization(roi_img, self.binarize_method_var.get())
-            img = bin_img if bin_img else roi_img
-        else:
-            img = roi_img
-        # 顯示到canvas
-        img = img.resize((800, 450))
-        self._tkimg = ImageTk.PhotoImage(img)
-        canvas.create_image(0, 0, anchor="nw", image=self._tkimg)
-
-    def _run_compare_analysis_gen(self):
-        """生成器：逐步比較新舊frame change結果"""
-        new_result = {}
-        total = self.total_frames
-        for idx in range(total):
-            has_change = self._detect_frame_change2(idx, self.cap_ui)
-            new_result[idx] = has_change
-            yield idx, has_change, new_result
-
-    def _open_compare_analysis_window(self):
-        import tkinter as tk
-        from tkinter import ttk
-
-        win = tk.Toplevel(self)
-        win.title("比較分析（新舊方法）")
-        win.geometry("1150x750")
-        win.grab_set()
-
-        # ROI顯示區
-        roi_canvas = tk.Canvas(win, width=800, height=450, bg="black")
-        roi_canvas.grid(row=0, column=1, rowspan=3, padx=10, pady=10)
-
-        # 當前frame號碼顯示與編輯
-        frame_idx_frame = tk.Frame(win)
-        frame_idx_frame.grid(row=3, column=1, sticky="n")
-        tk.Label(frame_idx_frame, text="當前Frame:").pack(side="left")
-        frame_idx_var = tk.StringVar(value="0")
-        frame_idx_entry = tk.Entry(frame_idx_frame, width=8, textvariable=frame_idx_var, justify="center")
-        frame_idx_entry.pack(side="left")
-        tk.Label(frame_idx_frame, text=f"/ {self.total_frames-1}").pack(side="left")
-
-        # 差異frame Listbox
-        tk.Label(win, text="差異幀號").grid(row=0, column=0)
-        diff_listbox = tk.Listbox(win, width=12, height=25)
-        diff_listbox.grid(row=1, column=0, sticky="n")
-
-        # 新舊變化幀 Listbox
-        tk.Label(win, text="舊方法變化幀").grid(row=0, column=2)
-        old_listbox = tk.Listbox(win, width=12, height=12)
-        old_listbox.grid(row=1, column=2, sticky="n")
-        tk.Label(win, text="新方法變化幀").grid(row=2, column=2)
-        new_listbox = tk.Listbox(win, width=12, height=12)
-        new_listbox.grid(row=3, column=2, sticky="n")
-
-        # ROI切換按鈕
-        btn_frame = tk.Frame(win)
-        btn_frame.grid(row=4, column=1, pady=5)
-        btn_prev = tk.Button(btn_frame, text="<< 前一幀")
-        btn_prev.pack(side="left", padx=5)
-        btn_next = tk.Button(btn_frame, text="下一幀 >>")
-        btn_next.pack(side="left", padx=5)
-        btn_show_old = tk.Button(btn_frame, text="顯示舊分析ROI")
-        btn_show_old.pack(side="left", padx=5)
-        btn_show_new = tk.Button(btn_frame, text="顯示新分析ROI")
-        btn_show_new.pack(side="left", padx=5)
-
-        # 進度條與數字
-        progress_frame = tk.Frame(win)
-        progress_frame.grid(row=5, column=1, pady=5)
-        progress = ttk.Progressbar(progress_frame, length=300)
-        progress.pack(side="left")
-        progress_label = tk.Label(progress_frame, text="0/0")
-        progress_label.pack(side="left", padx=10)
-
-        # 狀態
-        diff_frames = []
-        old_change_frames = []
-        new_change_frames = []
-        new_result = {}
-        gen = self._run_compare_analysis_gen()
-
-        # ROI顯示狀態
-        current_frame = [0]
-        show_new = [True]
-
-        def show_roi(frame_idx, use_new):
-            roi_img = self._get_roi_image(frame_idx, self.cap_ui)
-            if roi_img is None:
-                roi_canvas.delete("all")
-                return
-            if use_new and new_result.get(frame_idx, False):
-                bin_img = self._apply_binarization(roi_img, self.binarize_method_var.get())
-                img = bin_img if bin_img else roi_img
-            else:
-                img = roi_img
-            img = img.resize((800, 450))
-            self._tkimg = ImageTk.PhotoImage(img)
-            roi_canvas.delete("all")
-            roi_canvas.create_image(0, 0, anchor="nw", image=self._tkimg)
-            current_frame[0] = frame_idx
-            show_new[0] = use_new
-            frame_idx_var.set(str(frame_idx))
-
-        def goto_frame(frame_idx, use_new):
-            if 0 <= frame_idx < self.total_frames:
-                show_roi(frame_idx, use_new)
-                # 同步Listbox選中
-                for lb in [diff_listbox, old_listbox, new_listbox]:
+            # 讀取OCR數據並建立frame到OCR文本的映射
+            frame_to_ocr = {}
+            with open(ocr_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
-                        idx = lb.get(0, "end").index(frame_idx)
-                        lb.selection_clear(0, "end")
-                        lb.selection_set(idx)
-                        lb.see(idx)
-                    except ValueError:
-                        lb.selection_clear(0, "end")
-
-        def on_listbox_select(lb, use_new):
-            sel = lb.curselection()
-            if not sel: return
-            frame_idx = int(lb.get(sel[0]))
-            goto_frame(frame_idx, use_new)
-
-        diff_listbox.bind("<<ListboxSelect>>", lambda e: on_listbox_select(diff_listbox, True))
-        old_listbox.bind("<<ListboxSelect>>", lambda e: on_listbox_select(old_listbox, False))
-        new_listbox.bind("<<ListboxSelect>>", lambda e: on_listbox_select(new_listbox, True))
-
-        btn_show_old.config(command=lambda: show_roi(current_frame[0], False))
-        btn_show_new.config(command=lambda: show_roi(current_frame[0], True))
-        btn_prev.config(command=lambda: goto_frame(max(0, current_frame[0] - 1), show_new[0]))
-        btn_next.config(command=lambda: goto_frame(min(self.total_frames - 1, current_frame[0] + 1), show_new[0]))
-
-        # 鍵盤左右鍵切換
-        def on_key(event):
-            if event.keysym == "Left":
-                goto_frame(max(0, current_frame[0] - 1), show_new[0])
-            elif event.keysym == "Right":
-                goto_frame(min(self.total_frames - 1, current_frame[0] + 1), show_new[0])
-        win.bind("<Left>", on_key)
-        win.bind("<Right>", on_key)
-
-        # 支援直接輸入frame號碼跳轉
-        def on_frame_idx_entry(event):
-            try:
-                idx = int(frame_idx_var.get())
-                if 0 <= idx < self.total_frames:
-                    goto_frame(idx, show_new[0])
-            except Exception:
-                pass
-        frame_idx_entry.bind("<Return>", on_frame_idx_entry)
-
-        # 分析進度
-        def step():
-            try:
-                idx, has_change, new_result_local = next(gen)
-                new_result.update(new_result_local)
-                if self.change_cache.get(idx, False):
-                    old_change_frames.append(idx)
-                if has_change:
-                    new_change_frames.append(idx)
-                if has_change != self.change_cache.get(idx, False):
-                    diff_frames.append(idx)
-                    diff_listbox.insert("end", idx)
-                progress["maximum"] = self.total_frames
-                progress["value"] = idx + 1
-                progress_label.config(text=f"{idx+1}/{self.total_frames}")
-                win.update()
-                win.after(1, step)
-            except StopIteration:
-                # 填入新舊變化幀
-                for idx in old_change_frames:
-                    old_listbox.insert("end", idx)
-                for idx in new_change_frames:
-                    new_listbox.insert("end", idx)
-                progress["value"] = self.total_frames
-                progress_label.config(text=f"{self.total_frames}/{self.total_frames}")
-                # 印出分析資訊
-                print("==== 舊方法變化幀 ====")
-                print(old_change_frames)
-                print("==== 新方法變化幀 ====")
-                print(new_change_frames)
-                print("==== 差異幀 ====")
-                print(diff_frames)
-                tk.messagebox.showinfo("比較完成", f"新舊分析結果有 {len(diff_frames)} 個幀不同。")
-                # 預設顯示第一個差異幀
-                if diff_frames:
-                    goto_frame(diff_frames[0], True)
-                elif new_change_frames:
-                    goto_frame(new_change_frames[0], True)
-                else:
-                    goto_frame(0, True)
-
-        step()
-
-    def _start_analysis(self):
-        if self._has_existing_data():
-            self._open_compare_analysis_window()
-            return
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            ocr_text = obj.get("ocr_text", obj.get("text", ""))
+                            
+                            # 處理單個frame的OCR
+                            if "frame" in obj:
+                                frame_idx = int(obj["frame"])
+                                frame_to_ocr[frame_idx] = ocr_text
+                            
+                            # 處理multi_digit_group的matched_frames
+                            if obj.get("type") == "multi_digit_group" and "matched_frames" in obj:
+                                for matched_frame in obj["matched_frames"]:
+                                    frame_to_ocr[matched_frame] = ocr_text
+                    except json.JSONDecodeError:
+                        continue
             
-        """開始分析當前區域的變化幀和OCR - 智能版本"""
-        if not self.video_file_path or not self.roi_coords:
-            messagebox.showwarning("警告", "請先載入影片並設定ROI區域")
-            return
-        
-        # 檢查現有變化幀資料
-        existing_change_frames = [f for f, has_change in self.change_cache.items() if has_change]
-        
-        if existing_change_frames:
-            # 智能模式提示
-            result = messagebox.askyesno(
-                "智能分析模式", 
-                f"檢測到 {len(existing_change_frames)} 個既有變化幀。\n\n" +
-                "📊 智能模式：只對變化幀重新執行OCR分析\n" +
-                "🔄 完整模式：重新執行變化偵測 + OCR分析\n\n" +
-                "選擇 [是] 使用智能模式（推薦，速度更快）\n" +
-                "選擇 [否] 使用完整模式（重新分析所有幀）"
-            )
+            # 存入緩存以備後用
+            self.ocr_cache[region_name] = frame_to_ocr
             
-            if not result:
-                # 用戶選擇完整模式，清空變化快取
-                print("用戶選擇完整分析模式，清空變化快取")
-                self.change_cache.clear()
-        
-        # 清空當前分析結果（無論哪種模式都需要重新生成）
-        if self.current_analysis_cache:
-            clear_result = messagebox.askyesno(
-                "清空當前分析", 
-                "檢測到當前分析欄位有資料。\n\n是否清空重新開始？"
-            )
-            if clear_result:
-                self.current_analysis_cache.clear()
-                print("已清空當前分析結果")
-        
-        # 清空OCR快取（需要重新計算）
-        self.ocr_cache.clear()
-        
-        # 更新按鈕狀態
-        self.btn_analyze.config(state=tk.DISABLED)
-        self.btn_stop.config(state=tk.NORMAL)
-        
-        # 重置停止事件
-        self.stop_event.clear()
-        
-        # 啟動分析線程
-        self._start_analysis_thread(self.tmad_threshold_var.get(), self.diff_threshold_var.get())
-        
-        # 根據模式顯示不同的狀態訊息
-        if existing_change_frames and self.change_cache:  # 如果change_cache沒被清空，說明是智能模式
-            self._update_status_bar(f"開始智能分析 - 區域 {self.region_name} ({len(existing_change_frames)} 個變化幀)")
-            print(f"🚀 開始智能分析 - 區域: {self.region_name}, 變化幀數: {len(existing_change_frames)}")
-        else:
-            self._update_status_bar(f"開始完整分析 - 區域 {self.region_name}")
-            print(f"🔍 開始完整分析 - 區域: {self.region_name}, ROI: {self.roi_coords}")
-
-    def _has_existing_data(self) -> bool:
-        """檢查是否存在現有的分析資料"""
-        if not self.video_file_path:
-            return False
-        
-        ocr_path = Path("data") / self.video_title / f"{self.region_name}_ocr.json"
-        
-        return ocr_path.exists()
-
-    def _backup_current_data(self):
-        """備份當前資料用於比較"""
-        # 備份現有的標註和變化快取
-        self.old_annotations = self.annotations.copy()
-        self.old_change_cache = self.change_cache.copy()
-        print(f"已備份現有資料：{len(self.old_annotations)} 個標註，{len(self.old_change_cache)} 個變化記錄")
-
-    def _on_analysis_complete(self):
-        """分析自然完成後的處理 - 不自動儲存當前分析結果"""
-        print("主分析執行緒回報：分析自然完成。")
-        if hasattr(self, 'btn_analyze'): 
-            self.btn_analyze.config(state=tk.NORMAL if self.video_file_path else tk.DISABLED)
-        if hasattr(self, 'btn_stop'): 
-            self.btn_stop.config(state=tk.DISABLED)
-        
-        # 輸出簡單的分析統計
-        total_changes = len([f for f, c in self.change_cache.items() if c])
-        total_ocr = len(self.current_analysis_cache)
-        
-        print(f"\n📊 分析完成統計:")
-        print(f"   - 檢測到變化幀: {total_changes}")
-        print(f"   - OCR識別結果: {total_ocr}")
-        print(f"   - 區域: {self.region_name}")
-        print(f"   - OCR模型: {self.ocr_model_var.get()}")
-        
-        # 比較差異（如果有現有標註的話）
-        if self.annotations:
-            same_content = 0
-            different_content = 0
-            new_detections = 0
+            # 如果直接找到該frame的OCR
+            if target_frame in frame_to_ocr:
+                return frame_to_ocr[target_frame]
             
-            for frame_idx in self.current_analysis_cache:
-                old_content = self.annotations.get(frame_idx, "").strip()
-                new_content = self.current_analysis_cache[frame_idx].strip()
+            # 如果沒有直接找到，找最近的前一個有OCR的frame
+            sorted_frames = sorted(frame_to_ocr.keys())
+            for i in range(len(sorted_frames) - 1, -1, -1):
+                if sorted_frames[i] <= target_frame:
+                    return frame_to_ocr[sorted_frames[i]]
+            
+            return ""
+            
+        except Exception as e:
+            print(f"讀取 {region_name} 在frame {target_frame} 的OCR內容時出錯: {e}")
+            return ""
+
+    def _is_stage_start_frame(self, target_frame: int, pedal_segments: list) -> bool:
+        """判斷指定frame是否為STAGE開始（PEDAL為pattern 1）"""
+        try:
+            # 查找包含target_frame的PEDAL段落
+            for segment in pedal_segments:
+                start_frame = segment.get('start_frame', 0)
+                end_frame = segment.get('end_frame', start_frame)
+                pattern = segment.get('pattern')
                 
-                if frame_idx in self.annotations:
-                    if old_content == new_content:
-                        same_content += 1
+                # 如果target_frame在這個PEDAL段落範圍內，且pattern為1
+                if start_frame <= target_frame <= end_frame and pattern == 1:
+                    # 進一步檢查：target_frame應該正好是這個pattern 1段落的開始
+                    # 或者是在pattern 1段落內的STAGE開始點
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"判斷STAGE開始frame時出錯: {e}")
+            return False
+
+    def _preload_ocr_data(self):
+        """預載入region1~3的OCR數據到記憶體中"""
+        try:
+            if not self.video_file_path:
+                return
+            
+            print("開始預載入OCR數據...")
+            regions_to_load = ['region1', 'region2', 'region3']
+            
+            for region_name in regions_to_load:
+                ocr_path = Path("data") / self.video_title / f"{region_name}_ocr_testing.jsonl"
+                if not ocr_path.exists():
+                    print(f"OCR檔案不存在，跳過: {ocr_path}")
+                    continue
+                
+                # 讀取OCR數據並建立frame到OCR文本的映射
+                frame_to_ocr = {}
+                with open(ocr_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if isinstance(obj, dict):
+                                ocr_text = obj.get("ocr_text", obj.get("text", ""))
+                                
+                                # 處理單個frame的OCR
+                                if "frame" in obj:
+                                    frame_idx = int(obj["frame"])
+                                    frame_to_ocr[frame_idx] = ocr_text
+                                
+                                # 處理multi_digit_group的matched_frames
+                                if obj.get("type") == "multi_digit_group" and "matched_frames" in obj:
+                                    for matched_frame in obj["matched_frames"]:
+                                        frame_to_ocr[matched_frame] = ocr_text
+                        except json.JSONDecodeError:
+                            continue
+                
+                self.ocr_cache[region_name] = frame_to_ocr
+                print(f"已載入 {region_name} 的 {len(frame_to_ocr)} 筆OCR數據")
+            
+            print("OCR數據預載入完成")
+            
+        except Exception as e:
+            print(f"預載入OCR數據時出錯: {e}")
+
+    def _load_stage_analysis_to_treeview(self):
+        """載入手術階段分析結果到表格"""
+        if not hasattr(self, 'stage_analysis') or not self.stage_analysis:
+            print("沒有手術階段分析數據")
+            return
+            
+        # 檢查數據結構
+        regions_data = self.stage_analysis.get('regions', {})
+        if not regions_data:
+            print("stage_analysis中沒有regions數據")
+            return
+            
+        current_region = getattr(self, 'current_surgery_stage_region', None)
+        if not current_region:
+            print("沒有選擇當前手術階段區域")
+            return
+            
+        if current_region not in regions_data:
+            print(f"當前手術階段區域 '{current_region}' 沒有分析數據")
+            print(f"可用區域: {list(regions_data.keys())}")
+            return
+        
+        segments = regions_data[current_region]
+        print(f"載入 {current_region} 區域的 {len(segments)} 個段落")
+        
+        if not segments:
+            print(f"警告：{current_region} 區域沒有段落數據")
+            return
+        
+        # 取得PEDAL區域的數據，用於識別STAGE開始
+        pedal_segments = regions_data.get('PEDAL', [])
+        
+        for i, segment in enumerate(segments):
+            start_frame = segment.get('start_frame', 0)
+            end_frame = segment.get('end_frame', start_frame)
+            pattern = segment.get('pattern', f'未知模式_{i}')
+            
+            # 格式化內容顯示
+            if isinstance(pattern, int):
+                content = f"模式 {pattern}"
+            else:
+                content = str(pattern)
+            
+            # 初始化OCR值
+            iop_value = ""
+            asp_value = ""
+            vac_value = ""
+            
+            # 只有在當前選擇的是STAGE區域時，才讀取OCR數據
+            if current_region == 'STAGE':
+                # 檢查該frame是否為STAGE開始（PEDAL為pattern 1）
+                is_stage_start = self._is_stage_start_frame(start_frame, pedal_segments)
+                
+                if is_stage_start:
+                    print(f"識別到STAGE開始frame: {start_frame}（PEDAL為pattern 1）")
+                    # 讀取region1~3的OCR內容
+                    iop_value = self._get_ocr_text_at_frame("region1", start_frame)
+                    asp_value = self._get_ocr_text_at_frame("region2", start_frame)
+                    vac_value = self._get_ocr_text_at_frame("region3", start_frame)
+                    print(f"  OCR讀取結果 - IOP: {iop_value}, Asp: {asp_value}, Vac: {vac_value}")
+            
+            item_id_str = f"S{start_frame}"
+            # 根據當前區域決定插入的欄位數量
+            if current_region == 'STAGE':
+                # STAGE區域：6個欄位（包含OCR數據）
+                self.tree.insert("", "end", iid=item_id_str, 
+                                values=(start_frame, content, end_frame, iop_value, asp_value, vac_value))
+            else:
+                # PEDAL或其他區域：3個欄位
+                self.tree.insert("", "end", iid=item_id_str, 
+                                values=(start_frame, content, end_frame))
+            
+            print(f"  添加段落 {i+1}: 幀 {start_frame}-{end_frame}, 模式 {pattern}")
+        
+        print(f"表格載入完成，共添加 {len(segments)} 個項目")
+
+    def _sync_treeview_selection_to_frame(self, target_frame: int, force: bool = False):
+        """將表格選擇同步到指定幀"""
+        if self._sync_in_progress and not force:
+            return
+            
+        self._sync_in_progress = True
+        try:
+            print(f"同步表格選擇到幀 {target_frame}, force={force}")
+            
+            best_item = None
+            best_diff = float('inf')
+            
+            # 遍歷表格項目找到最接近的幀
+            for item in self.tree.get_children():
+                values = self.tree.item(item, 'values')
+                if not values:
+                    continue
+                    
+                try:
+                    item_frame = int(values[0])
+                    diff = abs(item_frame - target_frame)
+                    
+                    if self.surgery_stage_mode:
+                        # 手術階段模式：檢查目標幀是否在段落範圍內
+                        end_frame = int(values[2]) if len(values) > 2 and values[2] else item_frame
+                        if item_frame <= target_frame <= end_frame and diff < best_diff:
+                            best_item = item
+                            best_diff = diff
                     else:
-                        different_content += 1
-                else:
-                    new_detections += 1
+                        # OCR模式：找最接近的幀
+                        if diff < best_diff:
+                            best_item = item
+                            best_diff = diff
+                            
+                except (ValueError, IndexError):
+                    continue
             
-            print(f"\n🔍 與現有標註比較:")
-            print(f"   - 內容相同: {same_content}")
-            print(f"   - 內容不同: {different_content}")
-            print(f"   - 新檢測到: {new_detections}")
+            if best_item:
+                # 選中項目
+                self.tree.selection_set(best_item)
+                self.tree.focus(best_item)
+                
+                # 滾動到中間
+                self._center_treeview_item(best_item)
+                print(f"同步完成：選中項目 {best_item}")
+            else:
+                print("沒有找到匹配的表格項目")
+                
+        finally:
+            self._sync_in_progress = False
+
+    def _center_treeview_item(self, item_id: str):
+        """將指定的表格項目滾動到視窗中間"""
+        try:
+            # 獲取所有項目
+            all_items = self.tree.get_children()
+            if not all_items or item_id not in all_items:
+                return
+                
+            # 計算項目索引
+            item_index = list(all_items).index(item_id)
+            total_items = len(all_items)
             
-            if different_content > 0:
-                print(f"\n⚠️  有 {different_content} 個幀的內容與現有標註不同，請檢視後決定是否儲存")
-        
-        print(f"\n💾 請檢視'當前分析'欄位的結果，確認無誤後按'儲存標註'")
-        
-        # 只儲存變化幀資料，不儲存 annotations（包含 current_analysis_cache）
-        if self.video_file_path and self.region_name and self.change_cache:
-            try:
-                self._save_change_frames(self.region_name)
-                print("變化幀資料已自動儲存")
-            except Exception as e:
-                print(f"儲存變化幀資料時出錯: {e}")
-        
-        if self.total_frames > 0:
-            if hasattr(self, 'progress_var'): 
-                self.progress_var.set(self.total_frames)
-            if hasattr(self, 'lbl_prog'): 
-                self.lbl_prog.config(text=f"完成: {self.total_frames}/{self.total_frames}")
-        
-        self._update_status_bar("分析完成 - 請檢視結果後儲存")
-
-    def _compare_ocr_results(self) -> Dict[str, List[int]]:
-        """比較新舊OCR結果，返回差異統計"""
-        differences = {
-            'new_frames': [],      # 新增的幀
-            'modified_frames': [], # 內容變更的幀  
-            'removed_frames': []   # 移除的幀
-        }
-        
-        # 找出新增的幀
-        for frame_idx in self.annotations:
-            if frame_idx not in self.old_annotations:
-                differences['new_frames'].append(frame_idx)
-        
-        # 找出移除的幀
-        for frame_idx in self.old_annotations:
-            if frame_idx not in self.annotations:
-                differences['removed_frames'].append(frame_idx)
-        
-        # 找出內容變更的幀
-        for frame_idx in self.annotations:
-            if frame_idx in self.old_annotations:
-                old_text = self.old_annotations[frame_idx].strip()
-                new_text = self.annotations[frame_idx].strip()
-                if old_text != new_text:
-                    differences['modified_frames'].append(frame_idx)
-        
-        return differences
-
-    def _compare_change_results(self) -> Dict[str, List[int]]:
-        """比較新舊變化偵測結果，返回差異統計"""
-        differences = {
-            'new_changes': [],     # 新偵測到變化的幀
-            'lost_changes': [],    # 不再偵測到變化的幀
-        }
-        
-        # 找出新偵測到變化的幀
-        for frame_idx, has_change in self.change_cache.items():
-            if has_change and not self.old_change_cache.get(frame_idx, False):
-                differences['new_changes'].append(frame_idx)
-        
-        # 找出不再偵測到變化的幀
-        for frame_idx, had_change in self.old_change_cache.items():
-            if had_change and not self.change_cache.get(frame_idx, False):
-                differences['lost_changes'].append(frame_idx)
-        
-        return differences
-
-    def _print_comparison_report(self, ocr_diff: Dict[str, List[int]], change_diff: Dict[str, List[int]]):
-        """印出詳細的比較報告"""
-        
-        print(f"區域: {self.region_name}")
-        print(f"OCR模型: {self.ocr_model_var.get()}")
-        print(f"總幀數: {self.total_frames}")
-        print()
-        
-        # OCR結果比較
-        print("【OCR結果比較】")
-        if ocr_diff['new_frames']:
-            print(f"  新增OCR結果 ({len(ocr_diff['new_frames'])} 個):")
-            for frame_idx in sorted(ocr_diff['new_frames'])[:10]:  # 只顯示前10個
-                text = self.annotations.get(frame_idx, "")
-                print(f"    幀 {frame_idx}: '{text}'")
-            if len(ocr_diff['new_frames']) > 10:
-                print(f"    ... 還有 {len(ocr_diff['new_frames']) - 10} 個")
-        
-        if ocr_diff['removed_frames']:
-            print(f"  移除OCR結果 ({len(ocr_diff['removed_frames'])} 個):")
-            for frame_idx in sorted(ocr_diff['removed_frames'])[:10]:
-                old_text = self.old_annotations.get(frame_idx, "")
-                print(f"    幀 {frame_idx}: '{old_text}' (已移除)")
-            if len(ocr_diff['removed_frames']) > 10:
-                print(f"    ... 還有 {len(ocr_diff['removed_frames']) - 10} 個")
-        
-        if ocr_diff['modified_frames']:
-            print(f"  內容變更 ({len(ocr_diff['modified_frames'])} 個):")
-            for frame_idx in sorted(ocr_diff['modified_frames'])[:10]:
-                old_text = self.old_annotations.get(frame_idx, "")
-                new_text = self.annotations.get(frame_idx, "")
-                print(f"    幀 {frame_idx}: '{old_text}' -> '{new_text}'")
-            if len(ocr_diff['modified_frames']) > 10:
-                print(f"    ... 還有 {len(ocr_diff['modified_frames']) - 10} 個")
-        
-        if not any(ocr_diff.values()):
-            print("  無OCR結果差異")
-        
-        print()
-        
-        # 變化偵測比較
-        print("【變化偵測比較】")
-        if change_diff['new_changes']:
-            print(f"  新偵測到變化 ({len(change_diff['new_changes'])} 個): {sorted(change_diff['new_changes'])[:20]}")
-            if len(change_diff['new_changes']) > 20:
-                print(f"    ... 還有 {len(change_diff['new_changes']) - 20} 個")
-        
-        if change_diff['lost_changes']:
-            print(f"  不再偵測到變化 ({len(change_diff['lost_changes'])} 個): {sorted(change_diff['lost_changes'])[:20]}")
-            if len(change_diff['lost_changes']) > 20:
-                print(f"    ... 還有 {len(change_diff['lost_changes']) - 20} 個")
-        
-        if not any(change_diff.values()):
-            print("  無變化偵測差異")
-        
-        print()
-        
-        # 統計摘要
-        total_ocr_changes = len(ocr_diff['new_frames']) + len(ocr_diff['modified_frames']) + len(ocr_diff['removed_frames'])
-        total_change_changes = len(change_diff['new_changes']) + len(change_diff['lost_changes'])
-        
-        print("【差異摘要】")
-        print(f"  OCR結果差異總數: {total_ocr_changes}")
-        print(f"  變化偵測差異總數: {total_change_changes}")
-        print(f"  總差異數: {total_ocr_changes + total_change_changes}")
-
-    def _stop_analysis(self):
-        """停止分析 - 不自動儲存當前分析結果"""
-        self.stop_event.set()
-        
-        # 更新按鈕狀態
-        if hasattr(self, 'btn_analyze'):
-            self.btn_analyze.config(state=tk.NORMAL)
-        if hasattr(self, 'btn_stop'):
-            self.btn_stop.config(state=tk.DISABLED)
-        
-        # 只儲存變化幀資料，不儲存 annotations（包含 current_analysis_cache）
-        if self.video_file_path and self.region_name and self.change_cache:
-            try:
-                self._save_change_frames(self.region_name)
-                print("停止分析：變化幀資料已儲存")
-            except Exception as e:
-                print(f"停止分析時儲存變化幀資料出錯: {e}")
-        
-        self._update_status_bar("分析已停止 - 當前分析結果未儲存")
-        print("分析已停止 - 當前分析結果未儲存")
+            if total_items <= 1:
+                return
+                
+            # 計算要滾動到的位置（將目標項目置於中間）
+            visible_items = 10  # 假設可見項目數量
+            scroll_to = max(0, item_index - visible_items // 2)
+            scroll_fraction = scroll_to / max(1, total_items - visible_items)
+            scroll_fraction = min(1.0, max(0.0, scroll_fraction))
+            
+            # 執行滾動
+            self.tree.yview_moveto(scroll_fraction)
+            print(f"表格滾動到位置: {scroll_fraction:.2f}")
+            
+        except Exception as e:
+            print(f"滾動表格失敗: {e}")
 
     def _on_goto_frame(self, event=None):
         try:
@@ -3534,176 +3166,67 @@ class VideoAnnotator(tk.Frame):
             return
         self._show_frame(idx)
 
-    def _easyocr_predict(self, pil_img: Image.Image) -> str:
-        result = self.ocr_iface.predict(pil_img)
-        return result if result else "〈未識別〉"
-
     def _update_status_bar(self, message: str):
         """更新狀態列訊息"""
         if hasattr(self, 'status_var'):
             self.status_var.set(message)
         print(f"狀態: {message}")
 
-    # 1. 修改開啟影片的函數，加入清理舊資料和檢測進度的邏輯
-    def _open_video(self):
-        """開啟並載入影片文件"""
-        filetypes = [
-            ("Video files", "*.mp4 *.avi *.mov *.mkv"),
-            ("All files", "*.*")
-        ]
-        video_path = filedialog.askopenfilename(filetypes=filetypes, title="選擇影片文件")
-        if not video_path:
-            return False
-        
-        # 清理舊影片的資料和UI
-        self._clear_previous_video_data()
-        
-        # 載入新影片
-        self.video_file_path = Path(video_path)
-        self.video_title = self.video_file_path.stem
-        
-        # 設置影片輸入
-        try:
-            success = self._setup_video_input(self.video_file_path)
-            if not success:
-                self._update_status_bar("影片載入失敗")
-                return False
-            
-            self._update_status_bar(f"已載入: {self.video_title} ({self.total_frames} 幀)")
-            
-            # 載入全域 ROI 設定
-            self._load_roi_config()
-            
-            # 載入現有標註（如果有）以及變化幀列表
-            self._load_existing_data()
-            
-            # 檢查是否有分析進度，並自動跳轉
-            self._check_and_jump_to_analysis_position()
-            
-            # 顯示第一幀
-            self._show_frame(0)
-            
-            return True
-        except Exception as e:
-            messagebox.showerror("載入失敗", f"影片載入出錯:\n{e}")
-            print(f"載入影片時發生錯誤: {e}")
-            traceback.print_exc()
-            return False
-
-    # 2. 新增函數用於清理上一個影片的資料和UI
     def _clear_previous_video_data(self):
-        """Clears data and UI elements related to the previously loaded video."""
-        self.lbl_video_path.config(text="未選擇影片")
-        self.status_var.set("就緒")
-
-        # Signal existing threads to stop
-        self.stop_event.set()
-        for th_name in ["analysis_thread", "ocr_thread"]: # Add any other worker thread names here
-            thread = getattr(self, th_name, None)
-            if thread and thread.is_alive():
-                print(f"等待 {th_name} 結束...")
-                thread.join(timeout=1.5) # Wait a bit longer
-                if thread.is_alive():
-                    print(f"警告: {th_name} 未能在1.5秒內結束。")
-        self.stop_event.clear() # Reset event for new threads
-
-        # Release ONLY UI VideoCapture object here
-        # Worker threads will release their own VideoCaptures
-        if self.cap_ui:
-            try:
-                self.cap_ui.release()
-                print(f"cap_ui 已釋放。")
-            except Exception as e:
-                print(f"釋放舊 VideoCapture (cap_ui) 時出錯: {e}")
-        self.cap_ui = None
-        # self.cap_detect and self.cap_ocr are no longer class-level for workers
-
-        # Clear model interfaces if they have explicit stop/release methods
-        # (Assuming EasyOCRModel and ChangeDetectorInterface don't need explicit stopping here
-        # as they are re-instantiated or managed differently)
-
-        # Clear caches and data structures
-        self.change_cache.clear()
-        self.annotations.clear() 
-        self.ocr_cache.clear()
-        self.roi_image_cache.clear()
-
-        # Clear TreeView
-        if hasattr(self, 'tree'):
-            self.tree.delete(*self.tree.get_children())
-
-        # Clear video display label
-        if hasattr(self, 'lbl_video'): 
-            self.lbl_video.config(image=None) # Clear image
-            self.current_display_image = None 
-
-        # Reset current frame index and other video-specific states
+        """清除所有與當前影片相關的數據和UI狀態"""
+        self.playback_active = False
+        if hasattr(self, 'after_id') and self.after_id:
+            self.master.after_cancel(self.after_id)
+            self.after_id = None
+        
         self.current_frame_idx = 0
+        self.annotations.clear()
+        self.change_cache.clear()
+        self.ocr_cache.clear()  # 清除OCR緩存
+        
+        self.last_known_change_pos = -1
+        self.last_search_direction = "next"
+        self.last_loaded_roi_frame = -1
+        self.last_loaded_roi_image = None
+        self.frame_cache_dir = None
+        
+        if hasattr(self, 'tree'):
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+        self.video_file_path = None
+        self.video_title = ""
         self.total_frames = 0
-        self.original_vid_w = 0
-        self.original_vid_h = 0
-        # self.video_file_path = None # Keep this until a new video is truly loaded
-        # self.video_title = "" 
+        self.roi_coords = None
+        self.region_name = ""
+        self.unsaved_changes = False
+        
+        # 清除階段標籤
+        self.stage_analysis = None
+        self.stage_tag_meta.clear()
+        if self.stage_tag_canvas:
+            try:
+                self.stage_tag_canvas.delete("all")
+            except:
+                pass
+        
+        if self.cap_ui and self.cap_ui.isOpened():
+            self.cap_ui.release()
+        self.cap_ui = None
 
-        # Reset slider
+        if hasattr(self, 'status_var'):
+            self.status_var.set("就緒")
         if hasattr(self, 'slider'):
-            self.slider.config(to=0, state=tk.DISABLED) 
-            if hasattr(self, 'slider_var'): self.slider_var.set(0)
-        if hasattr(self, 'lbl_frame_num'):
-            self.lbl_frame_num.config(text="幀: - / -")
-
-        # Reset ROI related things - be careful if ROI settings are meant to be global or per-video
-        # self.roi_coords = None 
-        # self.roi_dict.clear() # This would clear all defined regions.
-        # if hasattr(self,'region_combobox'): self.region_combobox["values"] = [] 
-        # if hasattr(self,'region_var'): self.region_var.set("")
-
-        # Disable analysis/save buttons
-        if hasattr(self, 'btn_analyze'): # Assuming this is the correct button name
-             self.btn_analyze.config(state=tk.DISABLED)
-        # if hasattr(self, 'btn_save_all'): # Check actual save button name
-        #     self.btn_save_all.config(state=tk.DISABLED)
-        if hasattr(self, 'btn_stop'):
-            self.btn_stop.config(state=tk.DISABLED)
+            self.slider.set(0)
+            self.slider.config(to=0)
+        if hasattr(self, 'frame_label'):
+            self.frame_label.config(text="幀: 0 / 0")
+        if hasattr(self, 'time_label'):
+            self.time_label.config(text="00:00.000 / 00:00.000")
         
-        # Clear queues
-        for q_name in ["detect_queue", "ocr_queue", "result_queue"]:
-            q_obj = getattr(self, q_name, None)
-            if q_obj:
-                while not q_obj.empty():
-                    try:
-                        q_obj.get_nowait()
-                    except queue.Empty:
-                        break
-        print("先前影片資料已大部分清除 (佇列已清空)。")
-
-    # 3. 新增函數用於檢查分析進度並自動跳轉
-    def _check_and_jump_to_analysis_position(self):
-        """檢查分析進度並自動跳轉到適當位置"""
-        if not self.annotations and not self.change_cache:
-            # 沒有任何分析記錄，顯示第一幀
-            self._show_frame(0)
-            self._update_status_bar("已載入影片，可開始分析")
-            return
-        
-        # 有分析記錄，跳轉到最後分析的位置
-        if self.annotations:
-            last_annotated_frame = max(self.annotations.keys())
-            self._show_frame(last_annotated_frame)
-            self._update_status_bar(f"已跳轉到最後標註幀: {last_annotated_frame}")
-        elif self.change_cache:
-            last_analyzed_frame = max(self.change_cache.keys())
-            self._show_frame(last_analyzed_frame)
-            self._update_status_bar(f"已跳轉到最後分析幀: {last_analyzed_frame}")
-        else:
-            self._show_frame(0)
-            self._update_status_bar("已載入影片")
-
-    # 4. 如果需要，添加一個輔助方法用於更新滑塊位置
-    def _update_slider_position(self, frame_idx):
-        """更新滑塊位置到指定幀"""
-        if hasattr(self, 'slider_var'):
-            self.slider_var.set(frame_idx)
+        # 清除畫布
+        if hasattr(self, 'canvas'):
+            self.canvas.delete("all")
 
     # 新增處理 TreeView 選擇事件的方法
     def _on_treeview_select(self, event=None):
@@ -3721,6 +3244,9 @@ class VideoAnnotator(tk.Frame):
             # 如果當前已經在該幀，則不需要重新載入
             if frame_idx == self.current_frame_idx:
                 return
+            
+            # 設置標誌，表示用戶手動點擊了表格
+            self._user_clicked_treeview = True
             
             # 跳轉到該幀
             self._show_frame(frame_idx)
@@ -3813,10 +3339,7 @@ class VideoAnnotator(tk.Frame):
                     # 同時更新記憶體中的標註
                     self.annotations[frame_idx] = new_text
                     print(f"已更新記憶體中的標註數據")
-                    
-                    # 標記已修改，需要保存
-                    self.changes_made = True
-                    
+
                     # 關閉對話框
                     edit_dialog.destroy()
                     
@@ -3938,8 +3461,6 @@ class VideoAnnotator(tk.Frame):
                         del self.annotations[frame_idx]
                     # 從 TreeView 中刪除
                     self.tree.delete(item_id)
-                    # 標記已修改
-                    self.changes_made = True
                 except (ValueError, KeyError, TclError) as e:
                     print(f"刪除標註時出錯: {e}")
             self._update_status_bar("已刪除所選標註")
@@ -3978,25 +3499,6 @@ class VideoAnnotator(tk.Frame):
             print(f"載入現有數據時出錯: {e}")
             traceback.print_exc()
 
-    def _update_annotations_treeview(self):
-        """將標註數據更新到表格視圖"""
-        try:
-            # 清空現有表格內容
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            
-            # 按幀號排序顯示
-            for frame_idx, value in sorted(self.annotations.items()):
-                # 將標註添加到 TreeView
-                self.tree.insert("", tk.END, values=(frame_idx, value))
-                
-            # 更新狀態欄
-            self._update_status_bar(f"已載入 {len(self.annotations)} 個標註")
-            
-        except Exception as e:
-            print(f"更新標註表格時出錯: {e}")
-            traceback.print_exc()
-
     def _get_next_item(self, current_item):
         """獲取表格中的下一個項目"""
         try:
@@ -4025,44 +3527,6 @@ class VideoAnnotator(tk.Frame):
         if new_region == self.region_name:
             return
         
-        # 停止當前分析
-        if self.btn_stop.cget('state') == tk.NORMAL:
-            self._stop_analysis()
-        
-        # 檢查是否有未儲存的當前分析結果
-        if self.current_analysis_cache:
-            result = messagebox.askyesnocancel(
-                "切換區域", 
-                f"目前區域 '{self.region_name}' 有 {len(self.current_analysis_cache)} 個未儲存的當前分析結果。\n\n" +
-                "是否要先儲存這些結果？\n\n" +
-                "選擇 [是]：儲存後切換\n" +
-                "選擇 [否]：放棄當前分析結果並切換\n" +
-                "選擇 [取消]：不切換區域"
-            )
-            
-            if result is None:  # 取消
-                # 恢復原來的選擇
-                self.region_var.set(self.region_name)
-                return
-            elif result:  # 是 - 儲存後切換
-                try:
-                    self._save_annotations(self.region_name)
-                    self._save_change_frames(self.region_name)
-                except Exception as e:
-                    messagebox.showerror("儲存失敗", f"儲存失敗：{e}")
-                    self.region_var.set(self.region_name)
-                    return
-            # else: 否 - 直接切換，不儲存
-        else:
-            # 沒有當前分析結果，只儲存已確認的標註（如果有的話）
-            if self.annotations:
-                try:
-                    self._save_confirmed_annotations_only(self.region_name)
-                    self._save_change_frames(self.region_name)
-                    print(f"已自動儲存區域 '{self.region_name}' 的已確認標註")
-                except Exception as e:
-                    print(f"自動儲存區域 '{self.region_name}' 標註時出錯: {e}")
-        
         # 切換到新區域
         old_region = self.region_name
         self.region_name = new_region
@@ -4070,10 +3534,7 @@ class VideoAnnotator(tk.Frame):
         
         # 清空快取 (重要：避免新舊 region 資料混合)
         self.change_cache.clear()
-        self.ocr_cache.clear()
         self.annotations.clear()
-        self.roi_image_cache.clear()
-        self.current_analysis_cache.clear()  # 也清空當前分析快取
         
         # 載入新區域的資料
         self._load_existing_data()
@@ -4088,7 +3549,7 @@ class VideoAnnotator(tk.Frame):
         self._update_status_bar(f"已切換到區域: {new_region}")
 
     def _save_roi_config(self):
-        """儲存 ROI 設定到檔案"""
+        """儲存 ROI 設定到檔案，支持新的header格式"""
         roi_file = get_roi_config_path()
         if not roi_file:
             return
@@ -4097,10 +3558,23 @@ class VideoAnnotator(tk.Frame):
         roi_file.parent.mkdir(parents=True, exist_ok=True)
         
         try:
-            # 直接儲存 roi_dict，不包裝在 "rois" 鍵中
+            # 構建保存數據：如果有header配置，使用新格式；否則使用舊格式
+            save_data = {}
+            roi_header_dict = getattr(self, 'roi_header_dict', {})
+            
+            for region_name, roi_coords in self.roi_dict.items():
+                if region_name in roi_header_dict:
+                    # 新格式：[[roi_coords], [header_coords]]
+                    save_data[region_name] = [roi_coords, roi_header_dict[region_name]]
+                else:
+                    # 舊格式：直接保存座標
+                    save_data[region_name] = roi_coords
+            
             with open(roi_file, "w", encoding="utf-8") as f:
-                json.dump(self.roi_dict, f, indent=2, ensure_ascii=False)
+                json.dump(save_data, f, indent=2, ensure_ascii=False)
             print(f"ROI 設定已儲存至 {roi_file}")
+            if roi_header_dict:
+                print(f"包含 header 配置的區域: {list(roi_header_dict.keys())}")
         except Exception as e:
             print(f"儲存 ROI 設定失敗: {e}")
 
@@ -4110,100 +3584,40 @@ class VideoAnnotator(tk.Frame):
         
         try:
             if roi_file.exists():
-                with open(roi_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    
-                    # 支援兩種格式
-                    if "rois" in data:
-                        # 新格式：{"rois": {...}}
-                        loaded_rois = data["rois"]
-                    else:
-                        # 舊格式：直接是 ROI 字典
-                        loaded_rois = data
-                    
-                    # 直接使用載入的ROI，不再與預設合併
-                    self.roi_dict = loaded_rois.copy()
-                    print(f"已載入全域 ROI 設定: {loaded_rois}")
+                # 使用統一的配置加載函數，自動處理新舊格式
+                self.roi_dict = load_roi_config(roi_file)
+                
+                # 同時載入header配置（如果存在）
+                try:
+                    self.roi_header_dict = load_roi_header_config(roi_file)
+                    if self.roi_header_dict:
+                        print(f"已載入 ROI header 設定: {self.roi_header_dict}")
+                except Exception as e:
+                    print(f"載入 ROI header 設定失敗: {e}")
+                    self.roi_header_dict = {}
+                
+                print(f"已載入全域 ROI 設定: {self.roi_dict}")
             else:
                 print(f"全域 ROI 設定檔不存在，將建立預設配置")
                 # 如果檔案不存在，建立一個預設配置
                 self.roi_dict = {
                     "region2": [1640, 445, 1836, 525]
                 }
+                self.roi_header_dict = {}
         except Exception as e:
             print(f"載入全域 ROI 設定失敗: {e}")
             # 載入失敗時使用預設配置
             self.roi_dict = {
                 "region2": [1640, 445, 1836, 525]
             }
+            self.roi_header_dict = {}
         
         # 更新 UI（如果已建立）
         if hasattr(self, 'region_combobox'):
             self._update_roi_ui()
         
         print(f"最終 ROI 字典: {self.roi_dict}")
-
-    def _on_close(self):
-        """處理窗口關閉：停止線程並儲存標註進度。"""
-        print("關閉應用程式...")
-        self.stop_event.set() # 通知線程停止
-
-        # 停止分析（如果正在進行）
-        if hasattr(self, 'btn_stop') and self.btn_stop.cget('state') == tk.NORMAL:
-            try:
-                self.btn_analyze.config(state=tk.NORMAL)
-                self.btn_stop.config(state=tk.DISABLED)
-            except:
-                pass
-
-        # 儲存當前標註進度
-        if self.video_file_path and self.annotations:
-            print("正在自動儲存標註進度...")
-            try:
-                self._save_annotations(self.region_name)  # 修正：加上 region_name 參數
-                self._save_change_frames(self.region_name)
-            except Exception as e:
-                print(f"儲存標註時出錯: {e}")
-        else:
-            print("無需儲存標註 (未載入影片或無標註內容)。")
-
-        # 儲存 ROI 設定
-        try:
-            self._save_roi_config()
-        except Exception as e:
-            print(f"儲存 ROI 設定時出錯: {e}")
-
-        # 等待線程結束
-        print("等待背景線程結束...")
-        self.stop_event.set()
-        
-        # 等待各種線程結束
-        for thread_name in ['analysis_thread', 'ocr_thread', 'detect_thread']:
-            thread = getattr(self, thread_name, None)
-            if thread and thread.is_alive():
-                try:
-                    thread.join(timeout=2.0)  # 最多等待2秒
-                except:
-                    pass
-
-        self._finalize_close()
-
-    def _finalize_close(self):
-        """最終清理並關閉應用程式"""
-        # 釋放 VideoCapture
-        for cap in (self.cap_ui, self.cap_detect, self.cap_ocr):
-            try:
-                if cap:
-                    cap.release()
-            except Exception:
-                pass
-        
-        # 銷毀 Tk 主視窗
-        try:
-            self.master.destroy()
-        except TclError:
-            pass
-        print("應用程式已關閉。")
+        print(f"最終 ROI header 字典: {getattr(self, 'roi_header_dict', {})}")
 
     def _get_annotations_path(self, region_name: str) -> Path:
         """取得指定 region 的標註檔案路徑"""
@@ -4238,7 +3652,6 @@ class VideoAnnotator(tk.Frame):
             
         self.roi_coords = (x1, y1, x2, y2)
         self.roi_dict[self.region_name] = list(self.roi_coords)
-        self._save_roi_config()
         self._show_frame(self.current_frame_idx)
         self._update_status_bar(f"ROI 已套用: {self.roi_coords}")
 
@@ -4264,245 +3677,80 @@ class VideoAnnotator(tk.Frame):
         self.region_combobox["values"] = list(self.roi_dict.keys())
         self.region_var.set(name)
         self.region_name = name
-        self._save_roi_config()
         self._update_status_bar(f"已新增區域 {name}")
         # 新增完成後，把 ROI 座標同步到 Spinbox 方便微調
         self._update_roi_fields()
 
     def _update_roi_ui(self):
-        """更新 ROI 相關的 UI 元素"""
-        # 更新 Combobox
-        self.region_combobox["values"] = list(self.roi_dict.keys())
+        """更新OCR ROI UI"""
+        if not hasattr(self, 'region_combobox'):
+            return
+            
+        # 更新下拉選單選項
+        regions = list(self.roi_dict.keys())
+        self.region_combobox['values'] = regions
         
-        # 設定當前 region
-        if self.region_name in self.roi_dict:
-            self.region_var.set(self.region_name)
-            self.roi_coords = tuple(self.roi_dict[self.region_name])
-        else:
-            # 如果預設 region 不存在，取第一個可用的
-            if self.roi_dict:
-                self.region_name = list(self.roi_dict.keys())[0]
-                self.region_var.set(self.region_name)
+        # 設定當前選中項目
+        if self.region_name in regions:
+            self.region_combobox.set(self.region_name)
+        elif regions:
+            # 如果當前區域不在列表中，設定第一個區域為當前區域
+            self.region_name = regions[0]
+            self.region_combobox.set(regions[0])
+            # 設定對應的ROI座標
+            if self.region_name in self.roi_dict:
                 self.roi_coords = tuple(self.roi_dict[self.region_name])
+                self._update_roi_fields()
         
-        self._update_roi_fields()
-        print(f"ROI UI 已更新。目前區域: {self.region_name}, ROI: {self.roi_coords}")
+        print(f"OCR ROI UI已更新，當前區域: {self.region_name}")
 
-    def _tag_tree_item(self, frame_idx: int, tag: str):
-        for iid in self.tree.get_children():
-            if int(self.tree.set(iid, "frame")) == frame_idx:
-                current_tags = set(self.tree.item(iid, "tags"))
-                if tag not in current_tags:
-                    current_tags.add(tag)
-                    self.tree.item(iid, tags=tuple(current_tags))
-                break
+    def _get_full_frame_image_with_cache(self, frame_idx: int) -> Optional[Image.Image]:
+        """
+        獲取單個完整幀的PIL圖像，實現了磁碟快取機制。
+        1. 優先從 `data/<video_name>/frame_cache/frame_{frame_idx}.jpg` 讀取。
+        2. 如果快取不存在，則從 `self.cap_ui` 讀取。
+        3. 從影片讀取成功後，立刻將其寫入快取資料夾以備後用。
+        """
+        cache_dir = self._get_frame_cache_dir()
+        if not cache_dir:
+            print("錯誤: 無法獲取快取目錄")
+            return None # 無法獲取快取目錄，直接返回
 
-    def _get_roi_image(self, frame_idx: int, video_capture: cv2.VideoCapture) -> Optional[Image.Image]:
-        """取得指定幀的 ROI 圖像，使用傳入的 VideoCapture 實例"""
-        try:
-            # 先檢查快取
-            if frame_idx in self.roi_image_cache:
-                return self.roi_image_cache[frame_idx]
-            
-            # 嘗試從檔案載入ROI (如果存在且需要此優化)
-            roi_image_from_file = self._load_roi_from_file(frame_idx)
-            if roi_image_from_file:
-                self.roi_image_cache[frame_idx] = roi_image_from_file
-                return roi_image_from_file
-            
-            # 如果快取和檔案中都沒有，則從影片中提取
-            if not video_capture or not video_capture.isOpened() or not self.roi_coords:
-                print(f"警告: _get_roi_image 無法獲取圖像，VideoCapture 無效或 ROI 未設定 (frame {frame_idx})")
-                return None
-            
-            # 讀取幀
-            # 為確保執行緒安全，對 video_capture 的操作應謹慎
-            # 如果 video_capture 可能被多個地方同時 set/read，需要額外同步機制
-            # 但在此設計中，每個 worker 應有獨立的 vc，所以直接操作是OK的
-            video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = video_capture.read()
-            if not ret:
-                print(f"警告: _get_roi_image 無法讀取幀 {frame_idx} from video_capture")
-                return None
-            
-            # 轉換為 PIL 圖像
-            frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            
-            # 提取 ROI
-            roi_pil = self._crop_roi(frame_pil)
-            if roi_pil:
-                # 儲存到快取
-                self.roi_image_cache[frame_idx] = roi_pil 
-                # 考慮是否在此處保存 ROI 圖像到文件，或由特定流程統一處理
-                self._save_roi_image(frame_idx, roi_pil) 
-                
-            return roi_pil
-            
-        except Exception as e:
-            print(f"取得 ROI 圖像時出錯 (frame {frame_idx}): {e}")
-            traceback.print_exc()
+        cached_frame_path = cache_dir / f"frame_{frame_idx}.jpg"
+
+        # 1. 嘗試從快取讀取
+        if cached_frame_path.exists():
+            try:
+                return Image.open(cached_frame_path)
+            except Exception as e:
+                print(f"警告: 快取檔案 {cached_frame_path} 損壞，將重新生成: {e}")
+
+        # 2. 快取不存在，從影片讀取 (Fallback)
+        if not self.cap_ui or not self.cap_ui.isOpened():
+            print(f"錯誤: UI VideoCapture 未開啟，無法讀取幀 {frame_idx}")
             return None
-
-    def _perform_ocr(self, frame_idx: int, video_capture_for_roi: cv2.VideoCapture) -> str:
-        """對指定幀進行 OCR，傳入 VideoCapture 以獲取 ROI"""
-        try:
-            # 確保 video_capture_for_roi 是打開的
-            if not video_capture_for_roi or not video_capture_for_roi.isOpened():
-                print(f"錯誤: _perform_ocr 的 video_capture_for_roi 無效 (frame {frame_idx})")
-                return ""
-                
-            # 取得 ROI 圖像
-            roi_image = self._get_roi_image(frame_idx, video_capture_for_roi)
-            if roi_image is None:
-                print(f"OCR 時無法取得幀 {frame_idx} 的 ROI")
-                return ""
-                
-            # 使用 OCR 介面進行辨識
-            # 假設 self.ocr_iface.recognize 返回一個元組 (text, confidence)
-            # 或至少返回一個可以直接使用的 text 字串
-            result = self.ocr_iface.recognize(roi_image)
-            
-            ocr_text = ""
-            if isinstance(result, tuple) and len(result) > 0:
-                # 假設第一個元素是文字
-                ocr_text = str(result[0]) 
-            elif isinstance(result, str):
-                ocr_text = result
-            else:
-                print(f"OCR 結果格式無法識別 (frame {frame_idx}): {type(result)}")
-
-            return ocr_text if ocr_text else ""
-                
-        except AttributeError as ae:
-            print(f"OCR 屬性錯誤 (frame {frame_idx}): {ae} - 請檢查 OCR 模型接口是否正確實現 'recognize' 方法。")
-            traceback.print_exc()
-            return ""
-        except Exception as e:
-            print(f"OCR 處理幀 {frame_idx} 時出錯: {e}")
-            traceback.print_exc()
-            return ""
-
-    def _frame_to_timestamp(self, frame_idx: int) -> str:
-        """將幀號轉換為時間戳記"""
-        try:
-            if not self.cap_ui:
-                return "00:00:00"
-            
-            fps = self.cap_ui.get(cv2.CAP_PROP_FPS)
-            if fps <= 0:
-                fps = 30  # 預設 FPS
-            
-            seconds = frame_idx / fps
-            hours = int(seconds // 3600)
-            minutes = int((seconds % 3600) // 60)
-            secs = int(seconds % 60)
-            
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-            
-        except Exception as e:
-            print(f"轉換時間戳記時出錯: {e}")
-            return "00:00:00"
-
-    def _calculate_frame_diff(self, frame_idx: int) -> str:
-        """計算指定 frame 與前一幀的 diff 值"""
-        if frame_idx == 0:
-            return "0.000"  # 第一幀顯示 0
         
+        self.cap_ui.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame_bgr = self.cap_ui.read()
+
+        if not ret:
+            print(f"警告：從影片讀取幀 {frame_idx} 失敗")
+            return None
+        
+        # 轉換為PIL圖像
+        frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        
+        # 3. 寫入快取
         try:
-            roi_img1 = self._get_roi_image(frame_idx - 1, self.cap_ui)
-            roi_img2 = self._get_roi_image(frame_idx, self.cap_ui)
-            
-            if roi_img1 and roi_img2:
-                bin_method = self.binarize_method_var.get()
-                bin1 = self._apply_binarization(roi_img1, bin_method)
-                bin2 = self._apply_binarization(roi_img2, bin_method)
-                
-                if bin1 and bin2:
-                    arr1 = np.array(bin1.convert("L"))
-                    arr2 = np.array(bin2.convert("L"))
-                    diff = self._calculate_binary_diff(arr1, arr2)
-                    return f"{diff:.4f}"
-            
-            return "-"  # 無法計算時顯示 "-"
+            # 使用中等品質(85)的JPEG儲存，以平衡品質和檔案大小
+            frame_pil.save(cached_frame_path, "JPEG", quality=85)
         except Exception as e:
-            print(f"計算 frame {frame_idx} diff 時出錯: {e}")
-            return "-"
-
-    def _update_treeview_item(self, frame_idx: int, has_change: Optional[bool] = None, 
-                            content: Optional[str] = None, current_analysis: Optional[str] = None):
-        """更新 TreeView 中的特定項目。如果項目不存在則創建它。"""
-        item_id_str = f"F{frame_idx}"
-
-        if not self.tree.exists(item_id_str):
-            # 項目不存在，創建它
-            existing_content = self.annotations.get(frame_idx, "")
-            existing_current = self.current_analysis_cache.get(frame_idx, "")
+            print(f"警告: 無法寫入快取檔案 {cached_frame_path}: {e}")
             
-            # 計算 diff 值
-            diff_value = self._calculate_frame_diff(frame_idx)
-            
-            # 正確的 values 順序：(frame, diff, content, current_analysis)
-            self.tree.insert("", "end", iid=item_id_str, 
-                            values=(frame_idx, diff_value, existing_content, existing_current))
-            
-            # 如果 diff < 0.01，加上紅字 tag
-            if diff_value != "-" and float(diff_value) < 0.01:
-                self.tree.item(item_id_str, tags=("small_diff",))
-        else:
-            # 項目存在，更新 diff 值
-            diff_value = self._calculate_frame_diff(frame_idx)
-            self.tree.set(item_id_str, "diff", diff_value)
-            
-            # 更新 diff 相關的 tag
-            current_tags = list(self.tree.item(item_id_str, "tags"))
-            if diff_value != "-" and float(diff_value) < 0.01:
-                if "small_diff" not in current_tags:
-                    current_tags.append("small_diff")
-            else:
-                if "small_diff" in current_tags:
-                    current_tags.remove("small_diff")
-            self.tree.item(item_id_str, tags=tuple(current_tags))
-
-        # 更新其他內容
-        if content is not None:
-            self.tree.set(item_id_str, "content", content)  # 標註內容寫到 content 欄位
-        
-        if current_analysis is not None:
-            self.tree.set(item_id_str, "current_analysis", current_analysis)
-        
-        # 確保"changed"標籤正確應用
-        if self.change_cache.get(frame_idx, False):
-            current_tags = list(self.tree.item(item_id_str, "tags"))
-            if "changed" not in current_tags:
-                current_tags.append("changed")
-                self.tree.item(item_id_str, tags=tuple(current_tags))
+        return frame_pil
 
     def _save_annotations(self, region_name: str):
         """儲存標註結果 - 手動儲存時處理當前分析結果"""
-        # 如果有當前分析結果，詢問是否要覆寫
-        if self.current_analysis_cache:
-            result = messagebox.askyesno(
-                "確認儲存", 
-                f"檢測到 {len(self.current_analysis_cache)} 個當前分析結果。\n\n" +
-                "是否要將'當前分析'的結果覆寫到'標註內容'並儲存到檔案？\n\n" +
-                "選擇 [是]：將當前分析結果合併到標註中並儲存\n" +
-                "選擇 [否]：只儲存現有的標註內容，忽略當前分析結果"
-            )
-            if result:
-                # 將當前分析結果覆寫到正式標註
-                for frame_idx, content in self.current_analysis_cache.items():
-                    self.annotations[frame_idx] = content
-                    # 同時更新TreeView顯示
-                    item_id_str = f"F{frame_idx}"  # 修正：使用正確的 item_id 格式
-                    if self.tree.exists(item_id_str):
-                        self.tree.set(item_id_str, "content", content)
-                        self.tree.set(item_id_str, "current_analysis", "")  # 清空當前分析欄位
-                
-                # 清空暫存快取
-                self.current_analysis_cache.clear()
-                print(f"✅ 已將 {len(self.current_analysis_cache)} 個當前分析結果合併到標註中")
-            else:
-                print("❌ 用戶選擇不合併當前分析結果，只儲存現有標註")
         
         # 儲存正式的標註內容
         if not self.annotations:
@@ -4537,53 +3785,6 @@ class VideoAnnotator(tk.Frame):
             print(f"❌ 儲存標註 (region: {region_name}) 時出錯: {e}")
             traceback.print_exc()
 
-    def _save_change_frames(self, region_name: str):
-        """儲存變化幀列表為 JSON 格式 - 統一版本"""
-        if not self.change_cache:
-            print(f"區域 {region_name}: 無變化幀數據需要儲存。")
-            # self._update_status_bar(f"區域 {region_name}: 無變化幀可儲存") # 可選的狀態更新
-            return
-        
-        try:
-            if not self.video_file_path:
-                messagebox.showerror("錯誤", f"無法確定區域 {region_name} 的變化幀儲存路徑。影片是否已載入？")
-                print(f"錯誤: 無法獲取有效的 video_file_path for region {region_name}.")
-                # self._update_status_bar(f"區域 {region_name}: 變化幀儲存路徑無效") # 可選
-                return
-
-            video_data_dir = Path("data") / self.video_title
-            video_data_dir.mkdir(parents=True, exist_ok=True) 
-            
-            # 變化幀檔案路徑 (JSONL，每行為一個物件)
-            change_path = video_data_dir / f"{region_name}_ocr.jsonl"
-            
-            # 只儲存 has_change 為 True 的幀 (即偵測到變化)
-            changed_frame_indices = sorted([
-                frame_idx for frame_idx, has_change in self.change_cache.items() if has_change
-            ])
-            
-            if not changed_frame_indices:
-                print(f"區域 {region_name}: 計算後沒有偵測到任何變化幀可儲存。")
-                return
-
-            # 依照新格式寫入：每行 {frame, ocr_text, confidence}
-            with self.save_lock:
-                with open(change_path, 'w', encoding='utf-8') as f:
-                    for frame_idx in changed_frame_indices:
-                        record = {
-                            "frame": frame_idx,
-                            "ocr_text": self.annotations.get(frame_idx, ""),
-                            "confidence": 1.0  # 若無信心度資訊，預設 1.0
-                        }
-                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-            print(f"區域 {region_name} 的變化幀列表已儲存至: {change_path} (共 {len(changed_frame_indices)} 個變化幀)")
-            
-        except Exception as e:
-            messagebox.showerror("儲存變化幀失敗", f"儲存區域 {region_name} 變化幀時出錯: {e}")
-            print(f"儲存區域 {region_name} 變化幀時出錯: {e}")
-            traceback.print_exc()
-
     def _load_change_frames(self, region_name: str):
         """載入變化幀列表 - 支援 JSONL 格式（單行陣列）"""
         try:
@@ -4595,10 +3796,13 @@ class VideoAnnotator(tk.Frame):
             change_frames = None
 
             # 嘗試 .jsonl 格式
-            change_path = video_data_dir / f"{region_name}_ocr.jsonl"
+            change_path = video_data_dir / f"{region_name}_ocr_testing.jsonl"
             if change_path.exists():
                 print(f"載入變化幀檔案: {change_path}")
                 change_frames = []
+                # 使用buffer來高效處理matched_frames的順序插入
+                pending_matched_frames = []  # buffer: [(frame_idx, ocr_text, annotation_text)]
+                
                 with open(change_path, 'r', encoding='utf-8') as f:
                     for line_num, line in enumerate(f, 1):
                         line = line.strip()
@@ -4606,15 +3810,49 @@ class VideoAnnotator(tk.Frame):
                             continue
                         try:
                             obj = json.loads(line)
-                            if isinstance(obj, dict) and "frame" in obj:
-                                frame_idx = int(obj["frame"])
-                                change_frames.append(frame_idx)
-                                # 同步寫入 annotations，供後續顯示文字
+                            if isinstance(obj, dict):
                                 ocr_text_val = obj.get("ocr_text", obj.get("text", ""))
-                                if ocr_text_val is not None:
-                                    self.annotations[frame_idx] = ocr_text_val
+                                current_frame = None
+                                
+                                # 確定當前frame（統一處理）
+                                if "frame" in obj:
+                                    # single_digit 類型
+                                    current_frame = int(obj["frame"])
+                                elif obj.get("type") == "multi_digit_group" and "source_frame" in obj:
+                                    # multi_digit_group 類型
+                                    current_frame = int(obj["source_frame"])
+                                
+                                # 如果有當前frame，進行統一的處理流程
+                                if current_frame is not None:
+                                    # 先處理buffer中比當前frame更早的matched_frames
+                                    self._flush_pending_frames_before(pending_matched_frames, current_frame, change_frames)
+                                    
+                                    # 添加當前frame到change_frames
+                                    change_frames.append(current_frame)
+                                    
+                                    # 根據類型設置不同的標註
+                                    if ocr_text_val is not None:
+                                        self.annotations[current_frame] = ocr_text_val
+                                        # if "frame" in obj:
+                                        #     # single_digit: 直接使用OCR文字
+                                        #     self.annotations[current_frame] = ocr_text_val
+                                        # else:
+                                        #     # multi_digit_group: 標記為群組
+                                        #     self.annotations[current_frame] = f"[G] {ocr_text_val}"
+                                
+                                # multi_digit_group的額外處理：將matched_frames添加到buffer
+                                if obj.get("type") == "multi_digit_group" and "matched_frames" in obj and isinstance(obj["matched_frames"], list):
+                                    for matched_frame in obj["matched_frames"] :
+                                        annotation_text = f"{ocr_text_val}" if ocr_text_val is not None else None
+                                        pending_matched_frames.append((matched_frame, ocr_text_val, annotation_text))
+                        
                         except json.JSONDecodeError as e:
                             print(f"第 {line_num} 行解析失敗: {e}")
+                        except (ValueError, KeyError) as e:
+                            print(f"第 {line_num} 行數據格式錯誤: {e}")
+                    
+                    # 處理剩餘的buffer內容
+                    self._flush_all_pending_frames(pending_matched_frames, change_frames)
 
                 if change_frames:
                     self._rebuild_change_cache(change_frames)
@@ -4629,6 +3867,45 @@ class VideoAnnotator(tk.Frame):
             print(f"載入區域 {region_name} 的變化幀時出錯: {e}")
             traceback.print_exc()
             self._rebuild_change_cache([])
+
+    def _flush_pending_frames_before(self, pending_matched_frames: list, current_frame: int, change_frames: list):
+        """
+        處理buffer中比current_frame更早的matched_frames，並按順序插入到change_frames中
+        """
+        # 找出所有比current_frame早的frames
+        to_process = []
+        remaining = []
+        
+        for frame_data in pending_matched_frames:
+            frame_idx, ocr_text, annotation_text = frame_data
+            if frame_idx < current_frame:
+                to_process.append(frame_data)
+            else:
+                remaining.append(frame_data)
+        
+        # 按frame_idx排序並處理
+        to_process.sort(key=lambda x: x[0])
+        for frame_idx, ocr_text, annotation_text in to_process:
+            change_frames.append(frame_idx)
+            if annotation_text is not None:
+                self.annotations[frame_idx] = annotation_text
+        
+        # 更新buffer，只保留未處理的
+        pending_matched_frames.clear()
+        pending_matched_frames.extend(remaining)
+
+    def _flush_all_pending_frames(self, pending_matched_frames: list, change_frames: list):
+        """
+        處理buffer中剩餘的所有matched_frames
+        """
+        # 按frame_idx排序並處理所有剩餘的frames
+        pending_matched_frames.sort(key=lambda x: x[0]) #FIXME: 這可能不需要 如果資料源沒問題的話理論上都是照順序的
+        for frame_idx, ocr_text, annotation_text in pending_matched_frames:
+            change_frames.append(frame_idx)
+            if annotation_text is not None:
+                self.annotations[frame_idx] = annotation_text
+        
+        pending_matched_frames.clear()
     
     def _rebuild_change_cache(self, change_frames: list):
         """重建變化幀快取"""
@@ -4638,56 +3915,23 @@ class VideoAnnotator(tk.Frame):
         for frame_idx in change_frames:
             if 0 <= frame_idx < self.total_frames:
                 self.change_cache[frame_idx] = True
-            
-    def _on_analysis_complete(self):
-        """分析自然完成後的處理"""
-        print("主分析執行緒回報：分析自然完成。")
-        if hasattr(self, 'btn_analyze'): self.btn_analyze.config(state=tk.NORMAL if self.video_file_path else tk.DISABLED)
-        if hasattr(self, 'btn_stop'): self.btn_stop.config(state=tk.DISABLED)
-        
-        if self.video_file_path and self.region_name: 
-            self._save_annotations(self.region_name)
-            self._save_change_frames(self.region_name)
-        
-        if self.total_frames > 0:
-            if hasattr(self, 'progress_var'): self.progress_var.set(self.total_frames)
-            if hasattr(self, 'lbl_prog'): self.lbl_prog.config(text=f"完成: {self.total_frames}/{self.total_frames}")
-        
-        self._update_status_bar("分析流程已圓滿完成。")
 
     def _on_closing(self):
         """應用程式關閉時的處理 - 不自動儲存當前分析結果"""
         print("關閉應用程式...")
         
-        if self.analysis_thread and self.analysis_thread.is_alive():
-            print("正在停止分析執行緒...")
-            self.stop_event.set()
-            self.analysis_thread.join(timeout=2.5)
-            if self.analysis_thread.is_alive():
-                print("警告: 分析執行緒未能優雅停止。")
-        
         # 只儲存已確認的標註內容和變化幀資料，不包含當前分析快取
         if self.video_file_path and self.region_name:
             try:
-                # 只儲存正式的 annotations（不包含 current_analysis_cache）
                 if self.annotations:
                     self._save_confirmed_annotations_only(self.region_name)
                     print("已確認的標註資料已儲存")
-                
-                # 儲存變化幀資料
-                if self.change_cache:
-                    self._save_change_frames(self.region_name)
-                    print("變化幀資料已儲存")
                     
             except Exception as e:
                 print(f"關閉時儲存資料出錯: {e}")
         else:
             print("無需儲存資料 (未載入影片或無已確認的標註內容)")
-        
-        # 提醒用戶未儲存的當前分析結果
-        if self.current_analysis_cache:
-            print(f"⚠️ 注意：有 {len(self.current_analysis_cache)} 個當前分析結果未儲存")
-        
+               
         print("應用程式已關閉。")
         self.master.destroy()
 
@@ -4720,6 +3964,1363 @@ class VideoAnnotator(tk.Frame):
         except Exception as e:
             print(f"儲存已確認標註 (region: {region_name}) 時出錯: {e}")
             traceback.print_exc()
+
+    def _get_frame_cache_dir(self) -> Path | None:
+        """Helper to get the directory for the full frame cache."""
+        if not self.video_file_path:
+            return None
+        video_name = self.video_file_path.stem
+        cache_dir = Path("data") / video_name / "frame_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    # -------------------------
+    # Multi-track timeline UI
+    # -------------------------
+    def _create_stage_tag_area(self, parent_frame):
+        try:
+            container = tk.Frame(parent_frame)
+            container.pack(fill="x", pady=(0, 3))
+
+            # 控制列（ROI 勾選）
+            ctrl = tk.Frame(container)
+            ctrl.pack(fill="x", pady=(0, 2))
+            self.stage_tag_controls_frame = ctrl
+
+            tk.Label(ctrl, text="顯示階段標籤:").pack(side="left")
+            chk_master = tk.Checkbutton(ctrl, text="啟用", variable=self.stage_tag_visible, command=self._refresh_stage_tag_ui)
+            chk_master.pack(side="left", padx=(4, 8))
+
+            # 多軌道時間軸容器
+            timeline_frame = tk.Frame(container, relief="groove", bd=1)
+            timeline_frame.pack(fill="x", pady=(2, 0))
+            self.timeline_container = timeline_frame
+
+            # 創建捲動區域以容納多個軌道
+            self._create_scrollable_timeline_area(timeline_frame)
+            
+        except Exception as e:
+            print(f"建立多軌道時間軸失敗: {e}")
+
+    def _create_scrollable_timeline_area(self, parent):
+        """創建可捲動的多軌道時間軸區域"""
+        try:
+            scroll_frame = tk.Frame(parent)
+            scroll_frame.pack(fill="both", expand=True)
+
+            v_scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical")
+            
+            main_canvas = tk.Canvas(scroll_frame, 
+                                  height=120,
+                                  yscrollcommand=v_scrollbar.set,
+                                  highlightthickness=0)
+            
+            v_scrollbar.config(command=main_canvas.yview)
+            
+            tracks_frame = tk.Frame(main_canvas)
+            tracks_frame_window = main_canvas.create_window((0, 0), window=tracks_frame, anchor="nw")
+            
+            def _configure_scroll_region(event):
+                main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+            tracks_frame.bind("<Configure>", _configure_scroll_region)
+
+            def _configure_frame_width(event):
+                canvas_width = event.width
+                main_canvas.itemconfig(tracks_frame_window, width=canvas_width)
+            main_canvas.bind("<Configure>", _configure_frame_width)
+
+            main_canvas.pack(side="left", fill="both", expand=True)
+            v_scrollbar.pack(side="right", fill="y")
+            
+            self.timeline_main_canvas = main_canvas
+            self.timeline_tracks_frame = tracks_frame
+            self.timeline_v_scrollbar = v_scrollbar
+            
+            def _on_mousewheel(event):
+                if self.timeline_tracks:
+                    main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            main_canvas.bind("<MouseWheel>", _on_mousewheel)
+            
+        except Exception as e:
+            print(f"創建可捲動時間軸區域失敗: {e}")
+
+    def _create_timeline_track(self, region_name: str) -> dict:
+        """為指定ROI區域創建一個獨立的時間軸軌道"""
+        try:
+            if not hasattr(self, 'timeline_tracks_frame'):
+                return {}
+
+            timeline_canvas = tk.Canvas(self.timeline_tracks_frame,
+                                      height=self.track_height,
+                                      bg="#fafafa",
+                                      highlightthickness=1, # Add border for visual separation
+                                      highlightbackground="#cccccc")
+            
+            timeline_canvas.pack(fill="x", expand=True, pady=(0, self.track_spacing), padx=0)
+
+            timeline_canvas.bind("<Configure>", 
+                                 lambda e, rn=region_name: self._on_track_canvas_resize(e, rn))
+            timeline_canvas.bind("<Motion>", lambda e: self._on_track_motion(e, region_name))
+            timeline_canvas.bind("<Leave>", lambda e: self._hide_stage_tooltip())
+            timeline_canvas.bind("<Button-1>", lambda e: self._on_track_click(e, region_name))
+
+            track_data = {
+                'canvas': timeline_canvas,
+                'meta': {},
+                'region_name': region_name,
+                'segments': [] # Initialize segments list
+            }
+
+            self.timeline_tracks[region_name] = track_data
+            return track_data
+
+        except Exception as e:
+            print(f"創建軌道 {region_name} 失敗: {e}")
+            return {}
+
+    def _clear_all_tracks(self):
+        """清除所有軌道"""
+        try:
+            for track_data in self.timeline_tracks.values():
+                if 'canvas' in track_data and track_data['canvas']:
+                    track_data['canvas'].destroy()
+            
+            self.timeline_tracks.clear()
+            
+        except Exception as e:
+            print(f"清除軌道失敗: {e}")
+
+    def _build_timeline_labels(self, regions: list[str]):
+        # 清空舊標籤
+        if not self.timeline_labels_frame:
+            print("錯誤: timeline_labels_frame 未初始化。")
+            return
+            
+        for widget in self.timeline_labels_frame.winfo_children():
+            widget.destroy()
+
+        print(f"--- 正在建立時間軸標籤: {regions} ---")
+        try:
+            track_height_with_spacing = self.track_height + self.track_spacing
+            
+            for region in regions:
+                print(f"    - 建立 '{region}' 標籤...")
+                label_container = tk.Frame(self.timeline_labels_frame, height=track_height_with_spacing)
+                label_container.pack(fill="x", expand=True)
+                label_container.pack_propagate(False)
+
+                region_color = self.roi_color_map.get(region, "#666666")
+                name_label = tk.Label(label_container, text=region, 
+                                    bg="#f0f0f0", fg=region_color, 
+                                    font=("Arial", 9, "bold"),
+                                    anchor="w", padx=5, relief="solid", bd=1)
+                name_label.pack(fill="both", expand=True, pady=(0, self.track_spacing))
+            print("--- 時間軸標籤建立完畢 ---")
+
+        except Exception as e:
+            print(f"建立時間軸標籤失敗: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _get_slider_left_padding(self) -> int:
+        """獲取主slider的左側padding以對齊軌道"""
+        try:
+            # 由於slider使用 pack(fill="x", expand=True)，通常沒有額外的左側padding
+            # 但我們可以檢查slider的實際位置
+            if hasattr(self, 'slider') and self.slider:
+                return 0  # 通常slider會填滿整個寬度
+            return 0
+        except Exception as e:
+            print(f"獲取slider左側padding失敗: {e}")
+            return 0
+
+    def _get_slider_right_padding(self) -> int:
+        """獲取主slider的右側padding"""
+        try:
+            return 0  # slider通常填滿整個寬度，無右側padding
+        except Exception as e:
+            print(f"獲取slider右側padding失敗: {e}")
+            return 0
+
+    def _sync_track_positions_with_slider(self):
+        """同步所有軌道的位置與主slider對齊"""
+        try:
+            if not hasattr(self, 'slider') or not self.slider:
+                return
+                
+            # 強制更新slider以獲取正確尺寸
+            self.slider.update_idletasks()
+            
+            # 為每個軌道重新計算位置
+            for region_name, track_data in self.timeline_tracks.items():
+                if 'canvas' in track_data:
+                    canvas = track_data['canvas']
+                    # 重新渲染以確保與slider對齊
+                    self._render_track_tags(region_name, track_data)
+                    
+        except Exception as e:
+            print(f"同步軌道位置失敗: {e}")
+
+    def _force_timeline_alignment(self):
+        """強制重新對齊所有軌道與主slider"""
+        try:
+            # 延遲執行以確保所有UI組件已完全載入
+            def do_alignment():
+                if hasattr(self, 'slider') and self.slider and self.timeline_tracks:
+                    print("強制重新對齊軌道與主slider...")
+                    self.slider.update_idletasks()
+                    
+                    for region_name, track_data in self.timeline_tracks.items():
+                        if 'canvas' in track_data:
+                            track_data['canvas'].update_idletasks()
+                            self._render_track_tags(region_name, track_data)
+                    
+                    # 更新位置指示器
+                    self._update_track_position_indicators()
+                    print("軌道對齊完成")
+            
+            # 延遲200ms執行，確保UI已穩定
+            if hasattr(self, 'master'):
+                self.master.after(200, do_alignment)
+                
+        except Exception as e:
+            print(f"強制對齊失敗: {e}")
+
+    def _update_timeline_scroll_region(self):
+        """更新時間軸捲動區域"""
+        try:
+            if hasattr(self, 'timeline_main_canvas') and hasattr(self, 'timeline_tracks_frame'):
+                self.timeline_tracks_frame.update_idletasks()
+                self.timeline_main_canvas.configure(scrollregion=self.timeline_main_canvas.bbox("all"))
+        except Exception as e:
+            print(f"更新捲動區域失敗: {e}")
+
+    def _generate_pattern_color(self, base_color: str, pattern_id: int, avg_rmse: float, region_name: str) -> str:
+        """根據pattern ID和RMSE值生成漸變顏色"""
+        try:
+            if region_name == "PEDAL":
+                # PEDAL區域使用預定義的高對比度顏色
+                pedal_colors = [
+                    "#FF4444",  # 紅色
+                    "#44FF44",  # 綠色
+                    "#4444FF",  # 藍色
+                    "#FFAA00",  # 橙色
+                    "#AA44FF",  # 紫色
+                    "#44FFFF",  # 青色
+                    "#FF44AA",  # 粉紅色
+                    "#AAFF44",  # 黃綠色
+                    "#FF8844",  # 橘紅色
+                    "#4488FF",  # 天藍色
+                ]
+                
+                base_color = pedal_colors[pattern_id % len(pedal_colors)]
+                
+                # 根據RMSE調整亮度（RMSE越高越暗）
+                r, g, b = ImageColor.getrgb(base_color)
+                brightness_factor = max(0.4, 1.0 - min(avg_rmse / 100.0, 0.6))
+                
+                r = int(r * brightness_factor)
+                g = int(g * brightness_factor)
+                b = int(b * brightness_factor)
+                
+                return f"#{r:02x}{g:02x}{b:02x}"
+            else:
+                # 其他區域使用原有邏輯
+                r, g, b = ImageColor.getrgb(base_color)
+                h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+
+                params = self.color_variation_params.get(region_name, {'h_shift': 0.02, 's_factor': 0.9, 'v_factor': 0.9})
+                
+                # Use pattern_id for a cyclical hue shift
+                hue_offset = (pattern_id % 10) * params['h_shift']
+                new_h = (h + hue_offset) % 1.0
+
+                # Use RMSE for brightness variation (higher RMSE -> darker)
+                brightness_factor = 1.0 - min(avg_rmse / 150.0, 0.5) # Clamp max darkening
+                new_v = v * brightness_factor * params['v_factor']
+                
+                # Ensure saturation and value are within bounds
+                new_s = max(0.2, s * params['s_factor'])
+                new_v = max(0.1, new_v)
+
+                r_new, g_new, b_new = colorsys.hsv_to_rgb(new_h, new_s, new_v)
+                return f"#{int(r_new*255):02x}{int(g_new*255):02x}{int(b_new*255):02x}"
+            
+        except Exception as e:
+            print(f"生成pattern顏色失敗: {e}")
+            return base_color
+
+    def _is_dark_color(self, hex_color: str) -> bool:
+        """判斷顏色是否為深色"""
+        try:
+            hex_color = hex_color.lstrip('#')
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            
+            # 使用亮度公式
+            brightness = (r * 299 + g * 587 + b * 114) / 1000
+            return brightness < 128
+            
+        except Exception:
+            return False
+
+    def _load_stage_analysis(self):
+        try:
+            analysis_file_path = None
+            if not self.video_file_path:
+                print("錯誤：尚未載入影片，無法尋找 stage analysis 檔案。")
+                return
+
+            # 1. 優先嘗試自動尋找檔案
+            video_name = self.video_file_path.stem
+            expected_path = Path("data") / video_name / "stage_analysis.json"
+
+            if expected_path.exists():
+                print(f"自動找到 stage analysis 檔案: {expected_path}")
+                analysis_file_path = expected_path
+            else:
+                # 2. 自動尋找失敗，才彈出視窗讓使用者手動選擇
+                print(f"在預設路徑 {expected_path} 未找到檔案，請手動選擇。")
+                manual_path = filedialog.askopenfilename(
+                    title="自動尋找失敗，請手動選擇 stage_analysis.json 檔案",
+                    filetypes=[("JSON files", "*.json")],
+                    initialdir=self.video_file_path.parent if self.video_file_path else Path.cwd()
+                )
+                if manual_path:
+                    analysis_file_path = Path(manual_path)
+                else:
+                    print("未選擇檔案，操作取消。")
+                    return
+
+            if not analysis_file_path or not analysis_file_path.exists():
+                print(f"錯誤：分析檔案不存在或未選擇。")
+                return
+                
+            self.stage_analysis = json.loads(analysis_file_path.read_text(encoding="utf-8"))
+            print("階段分析檔載入成功。")
+            
+            # 調試信息：顯示載入的數據結構
+            if "regions" in self.stage_analysis:
+                regions = list(self.stage_analysis["regions"].keys())
+                print(f"載入的區域: {regions}")
+                for region in regions:
+                    segments_count = len(self.stage_analysis["regions"][region])
+                    print(f"  {region}: {segments_count} 個段落")
+            else:
+                print("警告：stage_analysis中沒有找到regions數據")
+            
+            # --- UI 更新 ---
+            if self.timeline_labels_frame and self.timeline_tracks_frame:
+                self._refresh_stage_tag_ui()
+            else:
+                print("警告: 時間軸UI元件尚未初始化，無法刷新。")
+
+        except json.JSONDecodeError as e:
+            print(f"載入階段分析檔失敗: JSON 格式錯誤 - {e}")
+        except Exception as e:
+            print(f"載入階段分析檔時發生未預期錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _build_stage_tag_roi_checks(self, regions: list[str]):
+        # 清空舊的控制項
+        for child in self.stage_tag_controls_frame.winfo_children()[2:]:  # 跳過前兩個（標籤 + 啟用）
+            child.destroy()
+        # 建立 ROI 勾選
+        for region in regions:
+            var = self.stage_tag_roi_vars.get(region) or tk.BooleanVar(value=True)
+            self.stage_tag_roi_vars[region] = var
+            color = self.roi_color_map.get(region, "#444")
+            cb = tk.Checkbutton(self.stage_tag_controls_frame, text=region, variable=var, fg=color, command=self._refresh_stage_tag_ui)
+            cb.pack(side="left", padx=4)
+
+    def _refresh_stage_tag_ui(self):
+        self._clear_all_tracks()
+        
+        if not self.stage_analysis or "regions" not in self.stage_analysis:
+            print("Stage analysis 資料未載入或格式不正確，無法刷新時間軸。")
+            return
+
+        print("\n--- 開始刷新多軌道時間軸 UI ---")
+        regions_data = self.stage_analysis.get("regions", {})
+        
+        # 固定只顯示 'PEDAL' 和 'STAGE'
+        regions_to_display = ['PEDAL', 'STAGE']
+        print(f"計畫顯示的軌道: {regions_to_display}")
+
+        self._build_timeline_labels(regions_to_display)
+
+        # 即使某些 ROI 被取消選取，我們仍然為它們創建軌道以保持垂直對齊
+        for region_name in regions_to_display:
+            track_data = self._create_timeline_track(region_name)
+            
+            # 渲染標籤
+            if region_name in regions_data:
+                region_content = regions_data[region_name]
+                segments = []
+                # 兼容處理兩種可能的資料結構: dict (新) 或 list (舊)
+                if isinstance(region_content, dict):
+                    segments = region_content.get("patterns", [])
+                elif isinstance(region_content, list):
+                    segments = region_content
+                
+                track_data['segments'] = segments  # 儲存 segment 資料以供後續渲染
+                print(f"為 '{region_name}' 找到 {len(segments)} 個區段。")
+            else:
+                track_data['segments'] = []
+                print(f"警告: 在 stage_analysis 中未找到 '{region_name}' 的資料。")
+
+        # 短暫延遲後對齊標籤和軌道的高度
+        self.master.after(50, self._align_labels_to_tracks)
+        print("--- 多軌道時間軸 UI 刷新結束 ---")
+
+    def _align_labels_to_tracks(self):
+        try:
+            if hasattr(self, 'timeline_labels_frame') and hasattr(self, 'timeline_tracks_frame'):
+                self.timeline_tracks_frame.update_idletasks()
+                tracks_height = self.timeline_tracks_frame.winfo_height()
+                self.timeline_labels_frame.configure(height=tracks_height)
+        except Exception as e:
+            print(f"Failed to align label heights: {e}")
+
+    def _on_track_canvas_resize(self, event, region_name):
+        """Redraw the track when the canvas is resized to ensure correct scaling."""
+        try:
+            track_data = self.timeline_tracks.get(region_name)
+            if not track_data or 'segments' not in track_data:
+                return
+            
+            # This is the main entry point for rendering.
+            self._render_track_tags(region_name, track_data, track_data['segments'])
+            self._draw_position_indicator(track_data['canvas'], self.current_frame_idx)
+        except Exception as e:
+            print(f"Error during track canvas resize for {region_name}: {e}")
+
+    def _render_track_tags(self, region_name: str, track_data: dict, segments: list):
+        """Renders the colored segments on a specific track canvas."""
+        try:
+            if not segments:
+                # Still draw the background even if there are no segments
+                canvas = track_data['canvas']
+                canvas.update_idletasks()
+                canvas_width = canvas.winfo_width()
+                canvas_height = canvas.winfo_height()
+                if canvas_width > 1:
+                    canvas.create_rectangle(0, 0, canvas_width, canvas_height, fill="#f0f0f0", outline="")
+                return
+
+            canvas = track_data['canvas']
+            meta_dict = track_data['meta']
+            
+            canvas.update_idletasks()
+            canvas_width = canvas.winfo_width()
+            canvas_height = canvas.winfo_height()
+
+            canvas.delete("all")
+            canvas.create_rectangle(0, 0, canvas_width, canvas_height, fill="#f0f0f0", outline="")
+            
+            if canvas_width <= 1 or not segments:
+                return
+
+            total_frames = max(1, self.total_frames - 1) if self.total_frames > 0 else 1
+            base_color = self.roi_color_map.get(region_name, "#666666")
+            
+            if self.show_alignment_grid:
+                self._draw_alignment_grid(canvas, canvas_width, canvas_height)
+            
+            self._draw_track_time_marks(canvas, canvas_width, canvas_height, total_frames)
+            
+            min_dx = 4
+            x_positions = []
+            prev_x_end = None
+            
+            for i, seg in enumerate(segments):
+                s = int(seg.get("start_frame", 0))
+                e = int(seg.get("end_frame", s))
+                pid = int(seg.get("pattern", -1))
+                rmse = float(seg.get("avg_rmse", 0.0))
+                
+                # 計算精確的像素位置，確保end_frame被包含
+                x_start = (s / total_frames) * canvas_width
+                x_end = ((e + 1) / total_frames) * canvas_width
+                
+                # 檢查是否與前一個段落連續
+                is_continuous = False
+                if i > 0:
+                    prev_seg = segments[i-1]
+                    prev_end = int(prev_seg.get("end_frame", 0))
+                    if prev_end + 1 == s:  # 連續段落
+                        is_continuous = True
+                        x_start = prev_x_end  # 精確銜接
+                
+                # 對於連續段落，不添加間隙；對於非連續段落，添加小間隙
+                if not is_continuous:
+                    x_start += 0.5
+                    x_end -= 0.5
+                else:
+                    x_end -= 0.5  # 只在右側留小間隙
+
+                if x_start >= x_end:
+                    continue
+                
+                # 確保最小可見寬度
+                tag_width = x_end - x_start
+                if tag_width < 2:
+                    center = (x_start + x_end) / 2
+                    x_start = center - 1
+                    x_end = center + 1
+
+                x_center = (x_start + x_end) / 2
+
+                # 只對非連續段落應用最小距離檢查
+                if not is_continuous and any(abs(x_center - xi) < min_dx for xi in x_positions):
+                    continue
+                    
+                x_positions.append(x_center)
+                prev_x_end = x_end
+                
+                pattern_color = self._generate_pattern_color(base_color, pid, rmse, region_name)
+                
+                tag_height = canvas_height - 8
+                y_top = 4
+                y_bottom = y_top + tag_height
+                
+                item_id = canvas.create_rectangle(
+                    x_start, y_top, x_end, y_bottom,
+                    fill=pattern_color, 
+                    outline="",
+                    width=0
+                )
+                
+                meta_dict[item_id] = {
+                    "region": region_name,
+                    "pattern": pid,
+                    "start": s,
+                    "end": e,
+                    "avg_rmse": rmse,
+                    "color": pattern_color
+                }
+                
+                if (x_end - x_start) >= 12:
+                    text_x = (x_start + x_end) / 2
+                    text_y = (y_top + y_bottom) / 2
+                    text_color = "#ffffff" if self._is_dark_color(pattern_color) else "#000000"
+                    
+                    canvas.create_text(
+                        text_x, text_y,
+                        text=str(pid),
+                        fill=text_color,
+                        font=("Arial", 7, "bold"),
+                        anchor="center"
+                    )
+        except Exception as e:
+            print(f"渲染軌道 {region_name} 標籤失敗: {e}")
+
+    def _draw_alignment_grid(self, canvas, width: int, height: int):
+        """繪製對齊網格（用於測試和調試）"""
+        try:
+            # 繪製邊框
+            canvas.create_rectangle(0, 0, width-1, height-1, outline="blue", width=1)
+            
+            # 繪製十字線標示中心
+            canvas.create_line(width//2, 0, width//2, height, fill="lightblue", width=1)
+            canvas.create_line(0, height//2, width, height//2, fill="lightblue", width=1)
+            
+            # 在四個角落標示尺寸
+            canvas.create_text(5, 5, text=f"0,0", fill="blue", font=("Arial", 6), anchor="nw")
+            canvas.create_text(width-5, 5, text=f"{width},0", fill="blue", font=("Arial", 6), anchor="ne")
+            canvas.create_text(5, height-5, text=f"0,{height}", fill="blue", font=("Arial", 6), anchor="sw")
+            canvas.create_text(width-5, height-5, text=f"{width},{height}", fill="blue", font=("Arial", 6), anchor="se")
+            
+        except Exception as e:
+            print(f"繪製對齊網格失敗: {e}")
+
+    def _draw_track_time_marks(self, canvas, width: int, height: int, total_frames: int):
+        """在軌道上繪製時間刻度標記"""
+        try:
+            if total_frames <= 0 or width <= 0:
+                return
+                
+            # 繪製刻度線（與主slider對齊）
+            num_marks = min(10, total_frames)  # 最多10個刻度
+            if num_marks <= 1:
+                return
+                
+            for i in range(num_marks + 1):
+                frame_pos = (i * total_frames) // num_marks
+                x = int((frame_pos / total_frames) * (width - 1)) if total_frames > 0 else 0
+                
+                # 繪製小刻度線
+                canvas.create_line(x, height - 2, x, height, fill="#cccccc", width=1)
+                
+        except Exception as e:
+            print(f"繪製時間刻度失敗: {e}")
+
+    def _update_track_position_indicators(self):
+        """在所有軌道上更新當前frame位置指示器"""
+        try:
+            if not self.timeline_tracks or self.total_frames <= 0:
+                return
+                
+            for region_name, track_data in self.timeline_tracks.items():
+                canvas = track_data['canvas']
+                self._draw_position_indicator(canvas, self.current_frame_idx)
+                
+        except Exception as e:
+            print(f"更新軌道位置指示器失敗: {e}")
+
+    def _draw_position_indicator(self, canvas, current_frame: int):
+        """在軌道上繪製當前frame位置指示器，使用Canvas完整寬度"""
+        try:
+            canvas.delete("position_indicator")
+
+            if self.total_frames <= 0:
+                return
+
+            canvas.update_idletasks()
+            canvas_width = canvas.winfo_width()
+            canvas_height = canvas.winfo_height()
+
+            if canvas_width <= 1:
+                return
+
+            total_frames = max(1, self.total_frames - 1)
+            indicator_x = int((current_frame / total_frames) * (canvas_width - 1)) if total_frames > 0 else 0
+            indicator_x = max(0, min(indicator_x, canvas_width - 1))
+
+            canvas.create_line(
+                indicator_x, 2, indicator_x, canvas_height - 2,
+                fill="#ff0000", width=3, tags="position_indicator"
+            )
+
+            triangle_size = 5
+            canvas.create_polygon(
+                indicator_x - triangle_size, 2,
+                indicator_x + triangle_size, 2,
+                indicator_x, 2 + triangle_size,
+                fill="#ff0000", outline="", tags="position_indicator"
+            )
+
+            canvas.create_polygon(
+                indicator_x - triangle_size, canvas_height - 2,
+                indicator_x + triangle_size, canvas_height - 2,
+                indicator_x, canvas_height - 2 - triangle_size,
+                fill="#ff0000", outline="", tags="position_indicator"
+            )
+
+        except Exception as e:
+            print(f"繪製位置指示器失敗: {e}")
+
+    def _on_track_motion(self, event, region_name: str):
+        """處理軌道滑鼠移動事件"""
+        try:
+            if region_name not in self.timeline_tracks:
+                return
+                
+            track_data = self.timeline_tracks[region_name]
+            canvas = track_data['canvas']
+            meta_dict = track_data['meta']
+            
+            # 使用改進的碰撞檢測（3x3像素範圍）
+            x, y = event.x, event.y
+            overlapping_items = canvas.find_overlapping(x-1, y-1, x+1, y+1)
+            
+            meta = None
+            for item_id in overlapping_items:
+                meta = meta_dict.get(item_id)
+                if meta:
+                    break
+                    
+            if not meta:
+                self._hide_stage_tooltip()
+                return
+                
+            # 構建tooltip文字
+            s, e = meta["start"], meta["end"]
+            dur_frames = e - s + 1
+            fps = self.fps if getattr(self, 'fps', 0) else 30.0
+            dur_sec = dur_frames / fps
+            
+            text = (f"{meta['region']} Pattern #{meta['pattern']}\n"
+                   f"幀範圍: {s} → {e} ({dur_frames} 幀)\n"
+                   f"時長: {dur_sec:.2f} 秒\n"
+                   f"RMSE: {meta['avg_rmse']:.2f}")
+            
+            self._show_stage_tooltip(event.x_root, event.y_root, text)
+            
+        except Exception as e:
+            print(f"處理軌道 {region_name} 滑鼠移動事件失敗: {e}")
+
+    def _on_track_click(self, event, region_name: str):
+        """處理軌道點擊事件"""
+        try:
+            if region_name not in self.timeline_tracks:
+                return
+                
+            track_data = self.timeline_tracks[region_name]
+            canvas = track_data['canvas']
+            meta_dict = track_data['meta']
+            
+            # 使用改進的碰撞檢測
+            x, y = event.x, event.y
+            overlapping_items = canvas.find_overlapping(x-1, y-1, x+1, y+1)
+            
+            for item_id in overlapping_items:
+                meta = meta_dict.get(item_id)
+                if meta:
+                    frame_to_show = int(meta["start"])
+                    self._show_frame(frame_to_show)
+                    print(f"點擊軌道 {region_name} 標籤 #{meta['pattern']}，跳轉到幀 {frame_to_show}")
+                    
+                    # 延遲同步表格選擇，確保幀已經更新
+                    self.master.after(50, lambda: self._sync_treeview_selection_to_frame(frame_to_show, force=True))
+                    break
+            
+        except Exception as e:
+            print(f"處理軌道 {region_name} 點擊事件失敗: {e}")
+
+    # 保留舊的方法以維持兼容性（如果還有地方在使用）
+    def _on_stage_tag_motion(self, event):
+        """舊的單軌道滑鼠移動處理（保持兼容性）"""
+        pass
+
+    def _on_stage_tag_click(self, event):
+        """舊的單軌道點擊處理（保持兼容性）"""
+        pass
+
+    # 簡易 tooltip（用 Toplevel）
+    def _show_stage_tooltip(self, x_root: int, y_root: int, text: str):
+        try:
+            if hasattr(self, '_stage_tip') and self._stage_tip:
+                self._stage_tip.destroy()
+        except Exception:
+            pass
+        try:
+            tip = tk.Toplevel(self)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x_root+12}+{y_root+12}")
+            lbl = tk.Label(tip, text=text, bg="#333", fg="#fff", font=("Arial", 9), padx=6, pady=4, justify="left")
+            lbl.pack()
+            self._stage_tip = tip
+        except Exception:
+            pass
+
+    def _hide_stage_tooltip(self):
+        try:
+            if hasattr(self, '_stage_tip') and self._stage_tip:
+                self._stage_tip.destroy()
+                self._stage_tip = None
+        except Exception:
+            pass
+
+
+
+    def _on_mode_tab_changed(self, event=None):
+        """處理模式標籤頁切換事件"""
+        try:
+            selected_tab = self.mode_notebook.nametowidget(self.mode_notebook.select())
+            
+            if selected_tab == self.ocr_mode_frame:
+                self.surgery_stage_mode = False
+                print("切換到 OCR 標註模式")
+                self._update_status_bar("已切換到 OCR 標註模式")
+            elif selected_tab == self.surgery_mode_frame:
+                self.surgery_stage_mode = True
+                print("切換到手術階段分析模式")
+                self._update_status_bar("已切換到手術階段分析模式")
+                
+                # 載入手術階段相關配置
+                self._load_surgery_stage_roi_config()
+                self._update_surgery_stage_roi_ui()
+                
+                # 確保有選中的手術階段區域
+                if not self.current_surgery_stage_region:
+                    regions = list(self.surgery_stage_roi_dict.keys())
+                    if regions:
+                        self.current_surgery_stage_region = regions[0]
+                        self.surgery_stage_combobox.set(regions[0])
+                        print(f"自動選擇手術階段區域: {self.current_surgery_stage_region}")
+                
+                # 重新載入階段分析數據和時間軸標籤
+                if self.video_file_path:
+                    self._load_stage_analysis()
+                    self._refresh_stage_tag_ui()
+        
+            # 更新模式相關的UI控制項顯示
+            self._update_mode_specific_controls()
+            
+            # 更新相關UI和數據
+            self._refresh_treeview()
+            
+            # 重新顯示當前幀以更新ROI顯示
+            if hasattr(self, 'current_frame_idx'):
+                self._show_frame(self.current_frame_idx)
+                
+        except Exception as e:
+            print(f"模式切換錯誤: {e}")
+            traceback.print_exc()
+
+    def _update_mode_specific_controls(self):
+        """根據當前模式顯示/隱藏相關的UI控制項"""
+        if not hasattr(self, 'binarize_checkbox') or not hasattr(self, 'btn_save'):
+            return
+            
+        if self.surgery_stage_mode:
+            # 手術階段分析模式：隱藏OCR專用功能
+            self.binarize_checkbox.pack_forget()
+            self.btn_save.pack_forget()
+            
+            # 自動關閉二值化模式
+            if self.binarize_mode_var.get():
+                self.binarize_mode_var.set(False)
+                print("自動關閉二值化模式（手術階段分析模式不需要）")
+            
+            print("隱藏OCR專用控制項：二值化顯示、儲存標註")
+        else:
+            # OCR標註模式：顯示OCR專用功能
+            self.btn_save.pack(side="right", padx=(0, 10))
+            self.binarize_checkbox.pack(side="right", padx=5)
+            print("顯示OCR專用控制項：二值化顯示、儲存標註")
+
+    def _on_surgery_stage_mode_toggle(self):
+        """保留舊方法以維持兼容性（已被標籤頁切換取代）"""
+        pass
+
+    def _on_surgery_stage_region_select(self, event=None):
+        """選擇手術階段區域"""
+        new_region = self.surgery_stage_region_var.get()
+        if not new_region:
+            return
+            
+        self.current_surgery_stage_region = new_region
+        
+        # 如果在手術階段模式，重新配置表格欄位並重載數據
+        if self.surgery_stage_mode:
+            self._refresh_treeview()
+        
+        # 更新當前手術階段ROI座標
+        if new_region in self.surgery_stage_roi_dict:
+            coords = self.surgery_stage_roi_dict[new_region]
+            print(f"切換到手術階段區域: {new_region}, ROI: {coords}")
+        else:
+            print(f"手術階段區域 {new_region} 尚未設定ROI")
+        
+        # 更新手術階段ROI座標顯示
+        self._update_surgery_stage_roi_fields()
+        
+        # 如果在手術階段模式，重新載入表格以顯示新區域的斷點
+        if self.surgery_stage_mode:
+            self._refresh_treeview()
+            
+        # 重新顯示當前幀
+        if hasattr(self, 'current_frame_idx'):
+            self._show_frame(self.current_frame_idx)
+            
+        self._update_status_bar(f"已切換到手術階段區域: {new_region}")
+
+    def _on_add_surgery_stage_region(self):
+        """添加新的手術階段區域"""
+        new_region = simpledialog.askstring("新增手術階段區域", "請輸入手術階段區域名稱:")
+        if not new_region:
+            return
+            
+        if new_region in self.surgery_stage_roi_dict:
+            messagebox.showwarning("重複名稱", f"手術階段區域 '{new_region}' 已存在")
+            return
+            
+        # 添加新區域，使用預設ROI
+        self.surgery_stage_roi_dict[new_region] = [100, 100, 300, 200]
+        self.current_surgery_stage_region = new_region
+        
+        # 更新UI
+        self._update_surgery_stage_roi_ui()
+        self._update_status_bar(f"已新增手術階段區域: {new_region}")
+
+    def _save_surgery_stage_roi_config(self):
+        """儲存手術階段ROI設定到檔案"""
+        roi_file = get_surgery_stage_roi_config_path()
+        if not roi_file:
+            return
+        
+        # 確保目錄存在
+        roi_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            with open(roi_file, "w", encoding="utf-8") as f:
+                json.dump(self.surgery_stage_roi_dict, f, indent=2, ensure_ascii=False)
+            print(f"手術階段ROI設定已儲存至 {roi_file}")
+            self._update_status_bar(f"手術階段ROI設定已儲存")
+        except Exception as e:
+            print(f"儲存手術階段ROI設定失敗: {e}")
+            self._update_status_bar(f"儲存手術階段ROI設定失敗: {e}")
+
+    def _load_surgery_stage_roi_config(self):
+        """載入手術階段ROI設定"""
+        roi_file = get_surgery_stage_roi_config_path()
+        
+        try:
+            if roi_file.exists():
+                with open(roi_file, "r", encoding="utf-8") as f:
+                    self.surgery_stage_roi_dict = json.load(f)
+                print(f"已載入手術階段ROI設定: {self.surgery_stage_roi_dict}")
+            else:
+                print(f"手術階段ROI設定檔不存在，將建立預設配置")
+                # 如果檔案不存在，建立一個預設配置
+                self.surgery_stage_roi_dict = {
+                    "手術開始": [100, 100, 300, 200],
+                    "切口階段": [400, 100, 600, 200],
+                    "縫合階段": [700, 100, 900, 200]
+                }
+        except Exception as e:
+            print(f"載入手術階段ROI設定失敗: {e}")
+            # 載入失敗時使用預設配置
+            self.surgery_stage_roi_dict = {
+                "手術開始": [100, 100, 300, 200],
+                "切口階段": [400, 100, 600, 200],
+                "縫合階段": [700, 100, 900, 200]
+            }
+
+        # 更新UI（如果已建立）
+        if hasattr(self, 'surgery_stage_combobox'):
+            self._update_surgery_stage_roi_ui()
+        
+        print(f"最終手術階段ROI字典: {self.surgery_stage_roi_dict}")
+
+    def _update_surgery_stage_roi_ui(self):
+        """更新手術階段ROI UI"""
+        if not hasattr(self, 'surgery_stage_combobox'):
+            return
+            
+        # 更新下拉選單選項
+        regions = list(self.surgery_stage_roi_dict.keys())
+        self.surgery_stage_combobox['values'] = regions
+        
+        # 設定當前選中項目
+        if self.current_surgery_stage_region in regions:
+            self.surgery_stage_combobox.set(self.current_surgery_stage_region)
+        elif regions:
+            self.current_surgery_stage_region = regions[0]
+            self.surgery_stage_combobox.set(regions[0])
+        
+        # 更新手術階段ROI座標顯示
+        self._update_surgery_stage_roi_fields()
+
+    def _apply_surgery_stage_roi_from_fields(self):
+        """把手術階段ROI Spinbox 數值寫回，並立即生效/儲存"""
+        if not self.current_surgery_stage_region:
+            messagebox.showwarning("警告", "請先選擇手術階段區域")
+            return
+            
+        x1 = self.surgery_stage_x1_var.get()
+        y1 = self.surgery_stage_y1_var.get()
+        x2 = self.surgery_stage_x2_var.get()
+        y2 = self.surgery_stage_y2_var.get()
+        
+        if x1 >= x2 or y1 >= y2:
+            messagebox.showwarning("座標錯誤", "x1,y1 必須小於 x2,y2")
+            return
+            
+        # 更新手術階段ROI座標
+        self.surgery_stage_roi_dict[self.current_surgery_stage_region] = [x1, y1, x2, y2]
+        
+        # 詢問是否儲存配置
+        result = messagebox.askyesno("儲存設定", f"手術階段ROI座標已更新，是否儲存到配置檔案？")
+        if result:
+            self._save_surgery_stage_roi_config()
+        
+        # 重新顯示當前幀
+        if hasattr(self, 'current_frame_idx'):
+            self._show_frame(self.current_frame_idx)
+            
+        status_msg = f"{self.current_surgery_stage_region} 手術階段ROI 已套用: ({x1},{y1},{x2},{y2})"
+        if result:
+            status_msg += " (已儲存)"
+        else:
+            status_msg += " (未儲存)"
+        self._update_status_bar(status_msg)
+
+    def _update_surgery_stage_roi_fields(self):
+        """將當前選中的手術階段ROI座標反映到4個Spinbox"""
+        if not self.current_surgery_stage_region or self.current_surgery_stage_region not in self.surgery_stage_roi_dict:
+            # 如果沒有選中區域或區域不存在，清空座標
+            self.surgery_stage_x1_var.set(0)
+            self.surgery_stage_y1_var.set(0)
+            self.surgery_stage_x2_var.set(0)
+            self.surgery_stage_y2_var.set(0)
+            return
+            
+        coords = self.surgery_stage_roi_dict[self.current_surgery_stage_region]
+        if coords and len(coords) >= 4:
+            x1, y1, x2, y2 = map(int, coords)
+            self.surgery_stage_x1_var.set(x1)
+            self.surgery_stage_y1_var.set(y1)
+            self.surgery_stage_x2_var.set(x2)
+            self.surgery_stage_y2_var.set(y2)
+
+    def _save_roi_to_cache(self):
+        """將當前選中區域的ROI圖像存入快取"""
+        if not self.current_surgery_stage_region:
+            messagebox.showwarning("警告", "請先選擇手術階段區域")
+            return
+            
+        if not hasattr(self, 'current_frame_idx') or not hasattr(self, 'video_file_path') or not self.video_file_path:
+            messagebox.showwarning("警告", "請先載入影片")
+            return
+            
+        try:
+            # 獲取當前幀的完整圖像
+            full_frame_image = self._get_full_frame_image_with_cache(self.current_frame_idx)
+            if not full_frame_image:
+                messagebox.showerror("錯誤", "無法獲取當前幀圖像")
+                return
+                
+            # 獲取當前區域的ROI座標
+            region_name = self.current_surgery_stage_region
+            if region_name not in self.surgery_stage_roi_dict:
+                messagebox.showwarning("警告", f"區域 {region_name} 尚未設定ROI座標")
+                return
+                
+            coords = self.surgery_stage_roi_dict[region_name]
+            x1, y1, x2, y2 = coords
+            
+            # 裁剪ROI圖像
+            roi_image = full_frame_image.crop((x1, y1, x2, y2))
+            
+            # 根據區域名稱決定是否進行二值化處理
+            if region_name == "PEDAL":
+                # PEDAL區域使用原圖
+                processed_image = roi_image
+            else:
+                # 其他區域進行二值化處理
+                processed_image = self._apply_binarization(roi_image, "otsu")
+                if processed_image is None:
+                    messagebox.showerror("錯誤", "二值化處理失敗")
+                    return
+            
+            # 轉換為numpy數組用於存儲
+            if region_name == "PEDAL":
+                cache_array = np.array(processed_image)
+            else:
+                # 二值化圖像轉換為PIL再轉numpy
+                if isinstance(processed_image, np.ndarray):
+                    cache_array = processed_image
+                else:
+                    cache_array = np.array(processed_image)
+            
+            # 創建快取目錄
+            cache_dir = Path("data/roi_img_caches") / region_name
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 檢查是否有重複的快取（門檻值10）
+            duplicate_info = self._check_duplicate_cache(cache_dir, cache_array, threshold=10.0)
+            if duplicate_info:
+                duplicate_number, duplicate_rmse = duplicate_info
+                result = messagebox.askyesno(
+                    "發現相似快取", 
+                    f"發現相似的快取檔案:\n"
+                    f"編號: #{duplicate_number}\n"
+                    f"相似度: RMSE = {duplicate_rmse:.2f} (< 10.0)\n\n"
+                    f"是否仍要儲存新的快取？"
+                )
+                if not result:
+                    self._update_status_bar(f"取消儲存快取，已存在相似快取 #{duplicate_number}")
+                    return
+            
+            # 生成快取編號（找到下一個可用編號）
+            cache_number = self._get_next_cache_number(cache_dir)
+            
+            # 保存為NPY格式（用於高效計算）
+            npy_filename = f"{cache_number}.npy"
+            npy_path = cache_dir / npy_filename
+            np.save(npy_path, cache_array)
+            
+            # 保存為PNG格式（用於直觀查看）
+            png_filename = f"{cache_number}.png"
+            png_path = cache_dir / png_filename
+            
+            # 根據數據類型保存PNG
+            if region_name == "PEDAL":
+                # PEDAL區域保存原始RGB圖像
+                processed_image.save(png_path)
+            else:
+                # 其他區域保存二值化圖像
+                if isinstance(processed_image, np.ndarray):
+                    # numpy數組轉PIL圖像
+                    if len(processed_image.shape) == 2:  # 灰度圖
+                        pil_image = Image.fromarray(processed_image, mode='L')
+                    else:  # RGB圖
+                        pil_image = Image.fromarray(processed_image)
+                    pil_image.save(png_path)
+                else:
+                    processed_image.save(png_path)
+            
+            # 更新內存快取
+            self.roi_image_cache[region_name] = cache_array.copy()
+            
+            # 更新狀態欄
+            self._update_status_bar(f"已將 {region_name} ROI圖像存入快取: #{cache_number} (npy+png)")
+            
+            messagebox.showinfo("成功", f"ROI圖像已存入快取\n區域: {region_name}\n編號: {cache_number}\n格式: {npy_filename} + {png_filename}")
+            
+        except Exception as e:
+            print(f"存入快取時發生錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("錯誤", f"存入快取失敗: {e}")
+
+    def _check_duplicate_cache(self, cache_dir: Path, new_cache_array: np.ndarray, threshold: float = 10.0) -> Optional[tuple[int, float]]:
+        """檢查是否有重複的快取，返回 (編號, RMSE) 或 None"""
+        try:
+            # 找到所有現有的npy檔案
+            existing_files = list(cache_dir.glob("*.npy"))
+            if not existing_files:
+                return None
+                
+            min_rmse = float('inf')
+            duplicate_number = None
+            
+            for npy_file in existing_files:
+                try:
+                    # 載入現有快取
+                    existing_array = np.load(npy_file)
+                    
+                    # 計算RMSE差異
+                    rmse = self._calculate_roi_diff_rmse(existing_array, new_cache_array)
+                    
+                    # 如果RMSE小於門檻值，認為是重複
+                    if rmse < threshold and rmse < min_rmse:
+                        min_rmse = rmse
+                        try:
+                            duplicate_number = int(npy_file.stem)
+                        except ValueError:
+                            continue
+                            
+                except Exception as e:
+                    print(f"檢查快取檔案 {npy_file} 時發生錯誤: {e}")
+                    continue
+                    
+            if duplicate_number is not None and min_rmse < threshold:
+                return (duplicate_number, min_rmse)
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"檢查重複快取時發生錯誤: {e}")
+            return None
+
+    def _get_next_cache_number(self, cache_dir: Path) -> int:
+        """獲取下一個可用的快取編號"""
+        try:
+            # 找到所有現有的npy檔案
+            existing_files = list(cache_dir.glob("*.npy"))
+            if not existing_files:
+                return 1
+                
+            # 提取編號並找到最大值
+            numbers = []
+            for file_path in existing_files:
+                try:
+                    # 檔案名格式: "數字.npy"
+                    number = int(file_path.stem)
+                    numbers.append(number)
+                except ValueError:
+                    # 跳過非數字檔名
+                    continue
+                    
+            if not numbers:
+                return 1
+                
+            return max(numbers) + 1
+            
+        except Exception as e:
+            print(f"獲取快取編號時發生錯誤: {e}")
+            return 1
+
+    def _load_roi_cache(self, region_name: str) -> Optional[np.ndarray]:
+        """載入指定區域的最新快取圖像"""
+        try:
+            cache_dir = Path("data/roi_img_caches") / region_name
+            if not cache_dir.exists():
+                return None
+                
+            # 找到所有NPY快取檔案
+            npy_files = list(cache_dir.glob("*.npy"))
+            if not npy_files:
+                return None
+                
+            # 按編號排序，取最新的（最大編號）
+            def get_file_number(file_path):
+                try:
+                    return int(file_path.stem)
+                except ValueError:
+                    return 0
+                    
+            latest_npy = max(npy_files, key=get_file_number)
+            cache_number = get_file_number(latest_npy)
+            
+            # 載入快取數組
+            cache_array = np.load(latest_npy)
+            
+            # 更新內存快取
+            self.roi_image_cache[region_name] = cache_array.copy()
+            
+            print(f"已載入 {region_name} 區域快取: #{cache_number} ({latest_npy.name})")
+            return cache_array
+            
+        except Exception as e:
+            print(f"載入 {region_name} 區域快取時發生錯誤: {e}")
+            return None
+
+    def _calculate_roi_diff_rmse(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """計算兩張ROI圖像的RMSE差異"""
+        try:
+            # 確保兩張圖像尺寸一致
+            if img1.shape != img2.shape:
+                return float('inf')  # 尺寸不一致，返回無限大差異
+            
+            # 轉換為float32進行計算
+            img1_f = img1.astype(np.float32)
+            img2_f = img2.astype(np.float32)
+            
+            # 計算均方根誤差 (RMSE)
+            mse = np.mean((img1_f - img2_f) ** 2)
+            rmse = np.sqrt(mse)
+            
+            return float(rmse)
+            
+        except Exception as e:
+            print(f"計算RMSE時發生錯誤: {e}")
+            return float('inf')
+
+    def _check_cache_hit(self, region_name: str, current_roi_image: Image.Image) -> tuple[bool, float]:
+        """檢查當前ROI圖像是否與快取匹配"""
+        try:
+            # 先嘗試從內存快取獲取
+            if region_name not in self.roi_image_cache:
+                # 如果內存中沒有，嘗試從檔案載入
+                cache_array = self._load_roi_cache(region_name)
+                if cache_array is None:
+                    return False, float('inf')
+            else:
+                cache_array = self.roi_image_cache[region_name]
+            
+            # 處理當前ROI圖像
+            if region_name == "PEDAL":
+                # PEDAL區域使用原圖
+                current_array = np.array(current_roi_image)
+            else:
+                # 其他區域進行二值化處理
+                processed_image = self._apply_binarization(current_roi_image, "otsu")
+                if processed_image is None:
+                    return False, float('inf')
+                
+                if isinstance(processed_image, np.ndarray):
+                    current_array = processed_image
+                else:
+                    current_array = np.array(processed_image)
+            
+            # 計算RMSE差異
+            rmse = self._calculate_roi_diff_rmse(cache_array, current_array)
+            
+            # 判斷是否為cache hit
+            is_hit = rmse < self.cache_hit_threshold
+            
+            return is_hit, rmse
+            
+        except Exception as e:
+            print(f"檢查cache hit時發生錯誤: {e}")
+            return False, float('inf')
+
+    def _perform_cache_comparison(self, full_frame_image: Image.Image):
+        """在切換frame時執行快取比對"""
+        try:
+            region_name = self.current_surgery_stage_region
+            if region_name not in self.surgery_stage_roi_dict:
+                return
+                
+            # 獲取ROI座標並裁剪圖像
+            coords = self.surgery_stage_roi_dict[region_name]
+            x1, y1, x2, y2 = coords
+            roi_image = full_frame_image.crop((x1, y1, x2, y2))
+            
+            # 檢查快取匹配
+            is_hit, rmse = self._check_cache_hit(region_name, roi_image)
+            
+            # 更新狀態欄顯示比對結果
+            if is_hit:
+                status_msg = f"🎯 Cache HIT! {region_name} RMSE: {rmse:.2f} (< {self.cache_hit_threshold})"
+                print(f"✅ {status_msg}")
+            else:
+                if rmse == float('inf'):
+                    status_msg = f"❌ No cache for {region_name}"
+                else:
+                    status_msg = f"❌ Cache MISS! {region_name} RMSE: {rmse:.2f} (>= {self.cache_hit_threshold})"
+                print(f"⚠️ {status_msg}")
+            
+            self._update_status_bar(status_msg)
+            
+        except Exception as e:
+            print(f"執行快取比對時發生錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _show_cache_info(self):
+        """顯示當前區域的快取資訊"""
+        if not self.current_surgery_stage_region:
+            messagebox.showwarning("警告", "請先選擇手術階段區域")
+            return
+            
+        try:
+            region_name = self.current_surgery_stage_region
+            cache_dir = Path("data/roi_img_caches") / region_name
+            
+            if not cache_dir.exists():
+                messagebox.showinfo("快取資訊", f"區域 '{region_name}' 尚無快取檔案")
+                return
+                
+            # 找到所有快取檔案
+            npy_files = list(cache_dir.glob("*.npy"))
+            png_files = list(cache_dir.glob("*.png"))
+            
+            if not npy_files and not png_files:
+                messagebox.showinfo("快取資訊", f"區域 '{region_name}' 尚無快取檔案")
+                return
+                
+            # 統計資訊
+            info_lines = [
+                f"區域: {region_name}",
+                f"快取目錄: {cache_dir}",
+                f"NPY檔案數量: {len(npy_files)}",
+                f"PNG檔案數量: {len(png_files)}",
+                ""
+            ]
+            
+            # 列出配對的檔案
+            if npy_files:
+                info_lines.append("現有快取編號:")
+                numbers = []
+                for npy_file in npy_files:
+                    try:
+                        number = int(npy_file.stem)
+                        numbers.append(number)
+                        png_file = cache_dir / f"{number}.png"
+                        status = "✓" if png_file.exists() else "✗"
+                        info_lines.append(f"  #{number}: {npy_file.name} + {number}.png {status}")
+                    except ValueError:
+                        info_lines.append(f"  {npy_file.name} (非標準格式)")
+                        
+                if numbers:
+                    info_lines.append(f"\n最新編號: #{max(numbers)}")
+                    info_lines.append(f"下一個編號: #{max(numbers) + 1}")
+            
+            # 顯示資訊對話框
+            info_text = "\n".join(info_lines)
+            messagebox.showinfo("快取資訊", info_text)
+            
+        except Exception as e:
+            print(f"顯示快取資訊時發生錯誤: {e}")
+            messagebox.showerror("錯誤", f"顯示快取資訊失敗: {e}")
 
 if __name__ == "__main__":
     root = tk.Tk()
