@@ -31,6 +31,7 @@ components/
 *.zip
 *.mp4
 *.txt
+!requirements.txt
 # --- 忽略某些可能過大的檔案或資料夾 ---
 # 忽略 data 目錄下的所有內容，但保留 data 目錄本身
 data/*

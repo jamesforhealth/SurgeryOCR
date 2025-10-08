@@ -16,6 +16,18 @@ This project aims to automate the extraction and labeling of critical numerical 
 * **Data Labeling:** Labels the extracted numerical data according to the identified surgical stage
 * **Output:** Generates structured output (e.g., jsonl) containing the extracted numerical data and their corresponding labels and timestamps.
 
+## Installation
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <your-repository-url>
+    cd SurgeryOCR
+    ```
+
+2.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+
 ## Usage
 
 This is the standard operating procedure for analyzing surgery videos. These commands assume you are running them from the root of the project directory.
