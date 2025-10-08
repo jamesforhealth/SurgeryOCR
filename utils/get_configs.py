@@ -56,9 +56,22 @@ def load_stage_config(path: Path) -> dict[str, List[int]]:
         data: dict[str, List[int]] = json.load(f)
     return data
 
+def load_ocr_char_sets_config(path: Path) -> dict[str, str]:
+    """Load OCR character sets dictionary from JSON file."""
+    if not path.exists():
+        return {}  # Return empty dict if file doesn't exist, as it's optional
+    with open(path, "r", encoding="utf-8") as f:
+        data: dict[str, str] = json.load(f)
+    return data
 
-
-
+def load_pattern_name_mapping(path: Path) -> Dict[str, Dict[str, str]]:
+    """Load pattern ID to name mapping from JSON file."""
+    if not path.exists():
+        print(f"Pattern name mapping file not found, skipping: {path}")
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data: Dict[str, Dict[str, str]] = json.load(f)
+    return data
 
 def get_diff_rule_config_path() -> Path:
     """回傳 config/diff_rule.json 路徑"""
@@ -116,3 +129,41 @@ def save_diff_rules(config: Dict[str, Any]) -> bool:
     except Exception as e:
         print(f"儲存差異規則配置失敗: {e}")
         return False
+
+def load_setting_regions_config(path: Path = None) -> Dict[str, Any]:
+    """載入設定值區域配置"""
+    if path is None:
+        path = Path("config") / "setting_regions.json"
+    
+    # 預設配置
+    default_config = {
+        "regions_with_setting_detection": ["region1", "region2", "region3", "region4", "region5"],
+        "detection_config": {
+            "sub_region_coords": {
+                "x1": 60,
+                "x2": 120,
+                "y1": 46,
+                "y2": 50
+            },
+            "white_pixel_threshold": 0.02,
+            "description": "如果子區域白色像素比例超過2%，判定為運作值（大數字）；否則為設定值（小數字）"
+        },
+        "regions_without_setting_detection": ["region6", "region7"],
+        "default_setting_value": False
+    }
+    
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                # 與預設配置合併，確保缺失的鍵有預設值
+                for key in default_config:
+                    if key not in config:
+                        config[key] = default_config[key]
+                return config
+        else:
+            print(f"設定區域配置檔案不存在，使用預設配置: {path}")
+            return default_config
+    except Exception as e:
+        print(f"載入設定區域配置失敗: {e}，使用預設配置")
+        return default_config

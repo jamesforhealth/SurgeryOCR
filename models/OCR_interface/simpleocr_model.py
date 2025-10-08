@@ -128,7 +128,7 @@ class CRNNModel(BaseOCRModel):
             
         return ''.join(text)
     
-    def recognize(self, image):
+    def recognize(self, image, **kwargs):
         """
         識別圖像中的文字
         

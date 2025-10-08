@@ -14,7 +14,7 @@ ENV/
 
 # --- 忽略測試用檔案
 test_*
-finetune_surgery_crnn.py
+components/
 
 # --- 忽略所有資料夾內層內的png（除了 roi_img_caches）---
 **/*.png
@@ -41,4 +41,11 @@ data/*
 !data/roi_img_caches/**
 
 components/
-#
+# 忽略一些暫時用不上的模型相關檔案
+models/*.py
+models/*.csv
+models/simple_OCR_models2/
+models/simple_OCR_models3/
+models/frame_change_detector/
+!models/OCR_interface/
+!models/OCR_interface/**

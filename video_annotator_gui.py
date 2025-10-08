@@ -30,11 +30,12 @@ from sklearn.cluster import KMeans
 from PIL import ImageColor
 
 # 新增：從 utils 導入 diff rule 載入器
-from utils.get_configs import load_diff_rules, load_roi_config, load_roi_header_config
+from utils.get_configs import load_diff_rules, load_roi_config, load_roi_header_config, load_pattern_name_mapping
 
 
 """回傳 config/rois.json 路徑"""
 get_roi_config_path = lambda : Path("config") / "rois.json"
+get_pattern_map_path = lambda : Path("config") / "pattern_name_mapping.json"
 
 """回傳 config/surgery_stage_rois.json 路徑"""
 get_surgery_stage_roi_config_path = lambda : Path("config") / "surgery_stage_rois.json"
@@ -47,11 +48,11 @@ class RegionPattern:
 
 
 frame_width = 80
-content_width = 120
+content_width = 180
 end_frame_width = 80
-iop_width = 80
+iop_width = 100
 asp_width = 120
-vac_width = 120
+vac_width = 150
 
 # -------------------- 主GUI --------------------
 class VideoAnnotator(tk.Frame):
@@ -85,6 +86,7 @@ class VideoAnnotator(tk.Frame):
         
         # OCR數據緩存，用於性能優化
         self.ocr_cache = {}  # {region_name: {frame: ocr_text}}
+        self.ocr_data_cache = {}  # {region_name: [ocr_records]} 用於階段分析
         
         # 控制表格同步的標誌
         self._user_clicked_treeview = False  # 用戶是否手動點擊了表格
@@ -176,7 +178,9 @@ class VideoAnnotator(tk.Frame):
             confidence_threshold=self.OCR_CONF_TH,
             debug_output=True  # 啟用詳細調試輸出
         )
-
+        
+        # 載入 pattern ID 到名稱的對應
+        self.pattern_name_map = load_pattern_name_mapping(get_pattern_map_path())
 
         self.roi_x1_var = tk.IntVar(value=0)
         self.roi_y1_var = tk.IntVar(value=0)
@@ -2792,15 +2796,15 @@ class VideoAnnotator(tk.Frame):
                 
             elif mode == "surgery_stage":
                 if region == "STAGE":
-                    # STAGE區域：起始幀、模式類型、結束幀、IOP、Asp、Vac
+                    # STAGE區域：變化幀、事件描述、階段結束幀、IOP設定值、Asp設定值、Vac設定值
                     columns = ("frame", "content", "end_frame", "iop", "asp", "vac")
                     self.tree.config(columns=columns)
-                    self.tree.heading("frame", text="起始幀")
-                    self.tree.heading("content", text="模式類型")
-                    self.tree.heading("end_frame", text="結束幀")
-                    self.tree.heading("iop", text="IOP")
-                    self.tree.heading("asp", text="Asp")
-                    self.tree.heading("vac", text="Vac")
+                    self.tree.heading("frame", text="變化幀")
+                    self.tree.heading("content", text="事件描述")
+                    self.tree.heading("end_frame", text="階段結束")
+                    self.tree.heading("iop", text="IOP設定值")
+                    self.tree.heading("asp", text="Asp設定值")
+                    self.tree.heading("vac", text="Vac設定值")
                     self.tree.column("frame", width=frame_width, anchor="center")
                     self.tree.column("content", width=content_width, anchor="center")
                     self.tree.column("end_frame", width=end_frame_width, anchor="center")
@@ -2936,6 +2940,313 @@ class VideoAnnotator(tk.Frame):
             print(f"讀取 {region_name} 在frame {target_frame} 的OCR內容時出錯: {e}")
             return ""
 
+    def _get_stage_ocr_values(self, region_name: str, start_frame: int, end_frame: int) -> dict:
+        """
+        讀取階段範圍內的所有OCR值，區分設定值和運作值
+        
+        Args:
+            region_name: 區域名稱 (region1, region2, region3)
+            start_frame: 階段開始幀
+            end_frame: 階段結束幀
+            
+        Returns:
+            dict: {"setting_values": [...], "operation_values": [...]}
+        """
+        if region_name not in self.ocr_data_cache:
+            return {"setting_values": [], "operation_values": []}
+        
+        ocr_data = self.ocr_data_cache[region_name]
+        setting_values = []
+        operation_values = []
+        
+        for record in ocr_data:
+            record_type = record.get("type", "")
+            ocr_text = record.get("ocr_text", "")
+            is_setting = record.get("setting", False)  # 新增的setting屬性
+            
+            frames_in_range = []
+            
+            if record_type == "multi_digit_group":
+                # multi_digit_group: 檢查matched_frames中在範圍內的幀
+                matched_frames = record.get("matched_frames", [])
+                frames_in_range = [f for f in matched_frames if start_frame <= f <= end_frame]
+                # multi_digit_group 總是設定值
+                is_setting = True
+                
+            elif record_type == "single_digit":
+                # single_digit: 檢查frame是否在範圍內
+                frame = record.get("frame")
+                if frame and start_frame <= frame <= end_frame:
+                    frames_in_range = [frame]
+            
+            # 如果有匹配的幀，添加到對應的列表
+            if frames_in_range and ocr_text:
+                value_info = {
+                    "text": ocr_text,
+                    "frames": frames_in_range,
+                    "confidence": record.get("confidence", 0.0)
+                }
+                
+                if is_setting:
+                    setting_values.append(value_info)
+                else:
+                    operation_values.append(value_info)
+        
+        return {"setting_values": setting_values, "operation_values": operation_values}
+
+    def _format_stage_values(self, values_dict: dict) -> str:
+        """
+        格式化階段OCR值的顯示
+        
+        Args:
+            values_dict: _get_stage_ocr_values的返回值
+            
+        Returns:
+            str: 格式化後的顯示字串
+        """
+        setting_values = values_dict.get("setting_values", [])
+        operation_values = values_dict.get("operation_values", [])
+        
+        result_parts = []
+        
+        # 優先顯示設定值
+        if setting_values:
+            setting_texts = [v["text"] for v in setting_values]
+            # 去重並排序
+            unique_settings = sorted(list(set(setting_texts)))
+            result_parts.append(f"設定: {', '.join(unique_settings)}")
+        
+        # 如果有運作值，也顯示（但可能數量很多，只顯示範圍或代表值）
+        if operation_values:
+            operation_texts = [v["text"] for v in operation_values]
+            unique_operations = sorted(list(set(operation_texts)), key=lambda x: float(x) if x.replace('.', '').isdigit() else 0)
+            
+            # 如果運作值太多，只顯示範圍
+            if len(unique_operations) > 5:
+                try:
+                    numeric_ops = [float(x) for x in unique_operations if x.replace('.', '').isdigit()]
+                    if numeric_ops:
+                        min_val, max_val = min(numeric_ops), max(numeric_ops)
+                        result_parts.append(f"運作: {min_val:.0f}~{max_val:.0f}")
+                    else:
+                        result_parts.append(f"運作: {len(unique_operations)}個值")
+                except:
+                    result_parts.append(f"運作: {len(unique_operations)}個值")
+            else:
+                result_parts.append(f"運作: {', '.join(unique_operations)}")
+        
+        return " | ".join(result_parts) if result_parts else ""
+
+    def _get_stage_setting_changes(self, region_name: str, start_frame: int, end_frame: int) -> list:
+        """
+        取得階段範圍內所有設定值變化的frame ID列表
+        
+        Args:
+            region_name: 區域名稱 (region1, region2, region3)
+            start_frame: 階段開始幀
+            end_frame: 階段結束幀
+            
+        Returns:
+            list: 包含設定值變化資訊的列表
+            [{"frame": frame_id, "text": ocr_text, "confidence": conf}, ...]
+        """
+        if region_name not in self.ocr_data_cache:
+            return []
+        
+        ocr_data = self.ocr_data_cache[region_name]
+        setting_changes = []
+        
+        for record in ocr_data:
+            record_type = record.get("type", "")
+            ocr_text = record.get("ocr_text", "")
+            is_setting = record.get("setting", False)
+            confidence = record.get("confidence", 0.0)
+            
+            # 只處理設定值
+            if record_type == "multi_digit_group":
+                # multi_digit_group 總是設定值
+                matched_frames = record.get("matched_frames", [])
+                for frame in matched_frames:
+                    if start_frame <= frame <= end_frame:
+                        setting_changes.append({
+                            "frame": frame,
+                            "text": ocr_text,
+                            "confidence": confidence,
+                            "type": "multi_digit"
+                        })
+                        
+            elif record_type == "single_digit" and is_setting:
+                # 只有標記為設定值的single_digit
+                frame = record.get("frame")
+                if frame and start_frame <= frame <= end_frame:
+                    setting_changes.append({
+                        "frame": frame,
+                        "text": ocr_text,
+                        "confidence": confidence,
+                        "type": "single_digit"
+                    })
+        
+        # 按frame排序並去重
+        setting_changes.sort(key=lambda x: x["frame"])
+        
+        # 去除連續相同數值的重複項（保留第一次變化）
+        filtered_changes = []
+        last_text = None
+        
+        for change in setting_changes:
+            if change["text"] != last_text:
+                filtered_changes.append(change)
+                last_text = change["text"]
+        
+        return filtered_changes
+
+    def _format_setting_changes_summary(self, changes: list) -> str:
+        """
+        格式化設定值變化的摘要顯示
+        
+        Args:
+            changes: _get_stage_setting_changes的返回值
+            
+        Returns:
+            str: 格式化的摘要字串
+        """
+        if not changes:
+            return "無設定值變化"
+        
+        if len(changes) == 1:
+            change = changes[0]
+            return f"Frame {change['frame']}: {change['text']}"
+        
+        # 多個變化時，顯示數量和範圍
+        first_frame = changes[0]["frame"]
+        last_frame = changes[-1]["frame"]
+        unique_values = list(set(c["text"] for c in changes))
+        
+        summary = f"{len(changes)}次變化 (Frame {first_frame}-{last_frame})"
+        if len(unique_values) <= 3:
+            summary += f": {' → '.join(unique_values)}"
+        else:
+            summary += f": {unique_values[0]} → ... → {unique_values[-1]}"
+        
+        return summary
+
+    def _insert_stage_setting_rows(self, stage_start: int, stage_end: int, stage_name: str,
+                                   iop_changes: list, asp_changes: list, vac_changes: list):
+        """
+        為階段內的設定值變化創建詳細的表格行項
+        
+        Args:
+            stage_start: 階段開始幀
+            stage_end: 階段結束幀
+            stage_name: 階段名稱
+            iop_changes: IOP設定值變化列表
+            asp_changes: Asp設定值變化列表
+            vac_changes: Vac設定值變化列表
+        """
+        # 收集所有設定值變化點，按frame排序
+        all_changes = []
+        
+        # 添加階段開始點
+        all_changes.append({
+            "frame": stage_start,
+            "type": "stage_start",
+            "stage_name": stage_name,
+            "iop_value": "",
+            "asp_value": "",
+            "vac_value": ""
+        })
+        
+        # 為每個設定值變化創建變化點記錄
+        for change in iop_changes:
+            change_record = {
+                "frame": change["frame"],
+                "type": "setting_change",
+                "stage_name": f"{stage_name} - IOP變化",
+                "iop_value": f"{change['text']}",
+                "asp_value": "",
+                "vac_value": ""
+            }
+            all_changes.append(change_record)
+        
+        for change in asp_changes:
+            change_record = {
+                "frame": change["frame"],
+                "type": "setting_change", 
+                "stage_name": f"{stage_name} - Asp變化",
+                "iop_value": "",
+                "asp_value": f"{change['text']}",
+                "vac_value": ""
+            }
+            all_changes.append(change_record)
+        
+        for change in vac_changes:
+            change_record = {
+                "frame": change["frame"],
+                "type": "setting_change",
+                "stage_name": f"{stage_name} - Vac變化", 
+                "iop_value": "",
+                "asp_value": "",
+                "vac_value": f"{change['text']}"
+            }
+            all_changes.append(change_record)
+        
+        # 按frame排序並去重（同一frame可能有多個區域變化）
+        all_changes.sort(key=lambda x: x["frame"])
+        
+        # 合併同一frame的多個變化
+        merged_changes = []
+        current_frame = None
+        current_record = None
+        
+        for change in all_changes:
+            if change["frame"] != current_frame:
+                # 新的frame，保存前一個記錄並開始新記錄
+                if current_record:
+                    merged_changes.append(current_record)
+                
+                current_frame = change["frame"]
+                current_record = {
+                    "frame": change["frame"],
+                    "type": change["type"],
+                    "stage_name": change["stage_name"],
+                    "iop_value": change["iop_value"],
+                    "asp_value": change["asp_value"],
+                    "vac_value": change["vac_value"]
+                }
+            else:
+                # 同一frame，合併變化
+                if change["iop_value"]:
+                    current_record["iop_value"] = change["iop_value"]
+                if change["asp_value"]:
+                    current_record["asp_value"] = change["asp_value"]
+                if change["vac_value"]:
+                    current_record["vac_value"] = change["vac_value"]
+                
+                # 更新stage_name以反映多重變化
+                if current_record["type"] == "setting_change" and change["type"] == "setting_change":
+                    current_record["stage_name"] = f"{stage_name} - 多項變化"
+        
+        # 添加最後一個記錄
+        if current_record:
+            merged_changes.append(current_record)
+        
+        # 插入到TreeView中
+        for i, change in enumerate(merged_changes):
+            item_id = f"S{change['frame']}_{i}"
+            
+            # 設定顯示內容
+            if change["type"] == "stage_start":
+                display_content = f"📍 {change['stage_name']} 開始"
+            else:
+                display_content = change["stage_name"]
+            
+            # 插入行項
+            self.tree.insert("", "end", iid=item_id,
+                            values=(change["frame"], display_content, stage_end,
+                                  change["iop_value"], change["asp_value"], change["vac_value"]))
+            
+            print(f"    添加設定值變化行: Frame {change['frame']} - {display_content}")
+
     def _is_stage_start_frame(self, target_frame: int, pedal_segments: list) -> bool:
         """判斷指定frame是否為STAGE開始（PEDAL為pattern 1）"""
         try:
@@ -2972,8 +3283,10 @@ class VideoAnnotator(tk.Frame):
                     print(f"OCR檔案不存在，跳過: {ocr_path}")
                     continue
                 
-                # 讀取OCR數據並建立frame到OCR文本的映射
-                frame_to_ocr = {}
+                # 讀取OCR數據並建立兩種cache
+                frame_to_ocr = {}  # 用於快速frame查找
+                ocr_records = []   # 用於階段分析，保留完整記錄
+                
                 with open(ocr_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         line = line.strip()
@@ -2984,20 +3297,25 @@ class VideoAnnotator(tk.Frame):
                             if isinstance(obj, dict):
                                 ocr_text = obj.get("ocr_text", obj.get("text", ""))
                                 
-                                # 處理單個frame的OCR
+                                # 添加到完整記錄列表
+                                ocr_records.append(obj)
+                                
+                                # 處理單個frame的OCR映射
                                 if "frame" in obj:
                                     frame_idx = int(obj["frame"])
                                     frame_to_ocr[frame_idx] = ocr_text
                                 
-                                # 處理multi_digit_group的matched_frames
+                                # 處理multi_digit_group的matched_frames映射
                                 if obj.get("type") == "multi_digit_group" and "matched_frames" in obj:
                                     for matched_frame in obj["matched_frames"]:
                                         frame_to_ocr[matched_frame] = ocr_text
                         except json.JSONDecodeError:
                             continue
                 
+                # 填充兩個cache
                 self.ocr_cache[region_name] = frame_to_ocr
-                print(f"已載入 {region_name} 的 {len(frame_to_ocr)} 筆OCR數據")
+                self.ocr_data_cache[region_name] = ocr_records
+                print(f"已載入 {region_name} 的 {len(frame_to_ocr)} 筆OCR映射和 {len(ocr_records)} 筆完整記錄")
             
             print("OCR數據預載入完成")
             
@@ -3009,6 +3327,11 @@ class VideoAnnotator(tk.Frame):
         if not hasattr(self, 'stage_analysis') or not self.stage_analysis:
             print("沒有手術階段分析數據")
             return
+        
+        # 確保OCR數據已載入
+        if not hasattr(self, 'ocr_data_cache') or not self.ocr_data_cache:
+            print("OCR數據未載入，開始載入...")
+            self._preload_ocr_data()
             
         # 檢查數據結構
         regions_data = self.stage_analysis.get('regions', {})
@@ -3043,7 +3366,7 @@ class VideoAnnotator(tk.Frame):
             
             # 格式化內容顯示
             if isinstance(pattern, int):
-                content = f"模式 {pattern}"
+                content = self.pattern_name_map.get(current_region, {}).get(str(pattern), f"模式 {pattern}")
             else:
                 content = str(pattern)
             
@@ -3059,18 +3382,27 @@ class VideoAnnotator(tk.Frame):
                 
                 if is_stage_start:
                     print(f"識別到STAGE開始frame: {start_frame}（PEDAL為pattern 1）")
-                    # 讀取region1~3的OCR內容
-                    iop_value = self._get_ocr_text_at_frame("region1", start_frame)
-                    asp_value = self._get_ocr_text_at_frame("region2", start_frame)
-                    vac_value = self._get_ocr_text_at_frame("region3", start_frame)
-                    print(f"  OCR讀取結果 - IOP: {iop_value}, Asp: {asp_value}, Vac: {vac_value}")
+                    
+                    # 讀取整個階段範圍內region1~3的設定值變化
+                    iop_changes = self._get_stage_setting_changes("region1", start_frame, end_frame)
+                    asp_changes = self._get_stage_setting_changes("region2", start_frame, end_frame)
+                    vac_changes = self._get_stage_setting_changes("region3", start_frame, end_frame)
+                    
+                    print(f"  IOP設定值變化: {len(iop_changes)} 次")
+                    print(f"  Asp設定值變化: {len(asp_changes)} 次") 
+                    print(f"  Vac設定值變化: {len(vac_changes)} 次")
+                    
+                    # 為這個階段創建設定值變化的詳細行項
+                    self._insert_stage_setting_rows(start_frame, end_frame, content, 
+                                                   iop_changes, asp_changes, vac_changes)
+                    continue  # 跳過原本的單行插入邏輯
             
             item_id_str = f"S{start_frame}"
             # 根據當前區域決定插入的欄位數量
             if current_region == 'STAGE':
                 # STAGE區域：6個欄位（包含OCR數據）
                 self.tree.insert("", "end", iid=item_id_str, 
-                                values=(start_frame, content, end_frame, iop_value, asp_value, vac_value))
+                                values=(start_frame, content, end_frame, "", "", ""))
             else:
                 # PEDAL或其他區域：3個欄位
                 self.tree.insert("", "end", iid=item_id_str, 
@@ -3431,6 +3763,7 @@ class VideoAnnotator(tk.Frame):
         self.treeview_menu.add_command(label="編輯標註", command=self._on_edit_annotation)
         self.treeview_menu.add_command(label="跳轉到此幀", command=lambda: self._on_treeview_select(None))
         self.treeview_menu.add_separator()
+        self.treeview_menu.add_command(label="查看設定值變化詳情", command=self._show_stage_setting_details)
         self.treeview_menu.add_command(label="刪除標註", command=self._on_delete_annotation)
         
         # 綁定右鍵事件
@@ -3464,6 +3797,128 @@ class VideoAnnotator(tk.Frame):
                 except (ValueError, KeyError, TclError) as e:
                     print(f"刪除標註時出錯: {e}")
             self._update_status_bar("已刪除所選標註")
+
+    def _show_stage_setting_details(self):
+        """顯示階段設定值變化的詳細資訊"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("警告", "請先選擇一個階段項目")
+            return
+        
+        item_id = selection[0]
+        if not item_id.startswith("S"):
+            messagebox.showwarning("警告", "請選擇一個STAGE階段項目")
+            return
+        
+        # 取得階段資訊
+        current_region = self.region_var.get()
+        if current_region != 'STAGE':
+            messagebox.showwarning("警告", "此功能只在STAGE模式下可用")
+            return
+        
+        try:
+            # 從TreeView取得階段資訊
+            values = self.tree.item(item_id, "values")
+            if len(values) < 3:
+                messagebox.showerror("錯誤", "無法取得階段資訊")
+                return
+            
+            start_frame = int(values[0])
+            end_frame = int(values[2])
+            stage_name = values[1]
+            
+            # 取得三個區域的設定值變化
+            iop_changes = self._get_stage_setting_changes("region1", start_frame, end_frame)
+            asp_changes = self._get_stage_setting_changes("region2", start_frame, end_frame)
+            vac_changes = self._get_stage_setting_changes("region3", start_frame, end_frame)
+            
+            # 創建詳情視窗
+            detail_window = tk.Toplevel(self.root)
+            detail_window.title(f"階段設定值變化詳情 - {stage_name}")
+            detail_window.geometry("800x600")
+            detail_window.resizable(True, True)
+            
+            # 創建主框架
+            main_frame = ttk.Frame(detail_window)
+            main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            # 標題
+            title_label = ttk.Label(main_frame, text=f"階段: {stage_name} (Frame {start_frame}-{end_frame})", 
+                                   font=("Arial", 12, "bold"))
+            title_label.pack(pady=(0, 10))
+            
+            # 創建Notebook來分頁顯示三個區域
+            notebook = ttk.Notebook(main_frame)
+            notebook.pack(fill=tk.BOTH, expand=True)
+            
+            regions_data = [
+                ("IOP (Region1)", iop_changes),
+                ("Asp (Region2)", asp_changes), 
+                ("Vac (Region3)", vac_changes)
+            ]
+            
+            for region_name, changes in regions_data:
+                # 創建頁面框架
+                page_frame = ttk.Frame(notebook)
+                notebook.add(page_frame, text=region_name)
+                
+                if not changes:
+                    no_data_label = ttk.Label(page_frame, text="此階段內沒有設定值變化", 
+                                            font=("Arial", 11))
+                    no_data_label.pack(expand=True)
+                    continue
+                
+                # 創建Treeview來顯示變化列表
+                columns = ("Frame", "Value", "Type", "Confidence")
+                tree = ttk.Treeview(page_frame, columns=columns, show="headings", height=15)
+                
+                # 設置欄位標題
+                tree.heading("Frame", text="Frame ID")
+                tree.heading("Value", text="設定值")
+                tree.heading("Type", text="類型")
+                tree.heading("Confidence", text="信心度")
+                
+                # 設置欄位寬度
+                tree.column("Frame", width=100)
+                tree.column("Value", width=150)
+                tree.column("Type", width=120)
+                tree.column("Confidence", width=100)
+                
+                # 添加滾動條
+                scrollbar = ttk.Scrollbar(page_frame, orient=tk.VERTICAL, command=tree.yview)
+                tree.configure(yscrollcommand=scrollbar.set)
+                
+                # 填入數據
+                for change in changes:
+                    tree.insert("", "end", values=(
+                        change["frame"],
+                        change["text"],
+                        change["type"],
+                        f"{change['confidence']:.3f}"
+                    ))
+                
+                # 佈局
+                tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                
+                # 添加統計資訊
+                stats_frame = ttk.Frame(page_frame)
+                stats_frame.pack(fill=tk.X, pady=(5, 0))
+                
+                stats_text = f"共 {len(changes)} 次設定值變化"
+                if changes:
+                    unique_values = len(set(c["text"] for c in changes))
+                    stats_text += f"，{unique_values} 個不同數值"
+                
+                stats_label = ttk.Label(stats_frame, text=stats_text)
+                stats_label.pack()
+            
+            # 添加關閉按鈕
+            close_button = ttk.Button(main_frame, text="關閉", command=detail_window.destroy)
+            close_button.pack(pady=(10, 0))
+            
+        except Exception as e:
+            messagebox.showerror("錯誤", f"顯示詳情時發生錯誤: {e}")
 
     def _load_existing_data(self):
         """載入現有的標註和變化幀資料"""

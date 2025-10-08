@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from utils.get_configs import load_diff_rules
+from utils.get_configs import load_diff_rules, load_pattern_name_mapping
 
 
 # -----------------------------
@@ -216,51 +216,48 @@ def match_best_pattern(
     return None, None
 
 
-def build_segments(matches: List[Tuple[int, Optional[int], Optional[float]]]) -> List[Dict[str, float]]:
-    """從逐幀匹配結果建立連續的區段"""
-    segments: List[Dict[str, float]] = []
-    current_pid: Optional[int] = None
-    start_idx: Optional[int] = None
-    rmses: List[float] = []
+def build_segments(
+    matches: List[Tuple[int, Optional[int], Optional[float]]],
+    pattern_mapping: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """
+    從幀匹配列表中構建連續的片段。
+    """
+    segments: List[Dict[str, Any]] = []
+    current_pattern: Optional[int] = None
+    start: Optional[int] = None
+    rmse_values: List[float] = []
+
+    if current_pattern is None:
+        return []
 
     def close_segment(end_frame: int):
-        nonlocal segments, current_pid, start_idx, rmses
-        if current_pid is not None and start_idx is not None:
-            avg_rmse = float(np.mean(rmses)) if rmses else 0.0
+        nonlocal segments, start, current_pattern, rmse_values
+        if current_pattern is not None:
+            avg_rmse = np.mean(rmse_values) if rmse_values else 0.0
+            pattern_name = pattern_mapping.get(str(current_pattern), f"Pattern {current_pattern}")
             segments.append({
-                "pattern": int(current_pid),
-                "start_frame": int(start_idx),
-                "end_frame": int(end_frame),
-                "avg_rmse": avg_rmse,
+                "pattern": current_pattern,
+                "pattern_name": pattern_name,
+                "start_frame": start,
+                "end_frame": end_frame,
+                "avg_rmse": float(avg_rmse),
+                "frame_count": end_frame - start + 1
             })
-        current_pid = None
-        start_idx = None
-        rmses.clear()
+            rmse_values = []
 
-    for frame_idx, pid, rmse in matches:
-        if pid is None:
-            if current_pid is not None:
-                close_segment(frame_idx - 1)
-            continue
-
-        if current_pid is None:
-            current_pid = pid
-            start_idx = frame_idx
+    for frame_idx, pattern_id, rmse in matches:
+        if pattern_id != current_pattern:
+            close_segment(frame_idx - 1)
+            current_pattern = pattern_id
+            start = frame_idx
             if rmse is not None:
-                rmses.append(rmse)
+                rmse_values.append(rmse)
         else:
-            if pid == current_pid:
-                if rmse is not None:
-                    rmses.append(rmse)
-            else:
-                close_segment(frame_idx - 1)
-                current_pid = pid
-                start_idx = frame_idx
-                rmses.clear()
-                if rmse is not None:
-                    rmses.append(rmse)
+            if rmse is not None:
+                rmse_values.append(rmse)
 
-    if current_pid is not None and start_idx is not None:
+    if current_pattern is not None and start is not None:
         last_frame = matches[-1][0] if matches else 0
         close_segment(last_frame)
 
@@ -360,7 +357,7 @@ def analyse_video(
     output_dir: Optional[Path] = None,
     args: argparse.Namespace,
 ) -> Path:
-    """採用「優化的 PEDAL 前後幀比較法」進行分析"""
+    """對單一影片進行分析"""
     
     diff_rules = load_diff_rules()
     cap = cv2.VideoCapture(str(video_path))
@@ -443,7 +440,9 @@ def analyse_video(
 
     regions_output: Dict[str, List[Dict[str, float]]] = {}
     for region_name, matches in region_matches.items():
-        segments = build_segments(matches)
+        # 使用新的 build_segments 函數
+        region_pattern_map = load_pattern_name_mapping(Path("config/pattern_name_mapping.json")).get(region_name, {})
+        segments = build_segments(matches, region_pattern_map)
         regions_output[region_name] = segments
 
     video_name = video_path.stem

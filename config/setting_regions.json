@@ -1,0 +1,15 @@
+{
+  "regions_with_setting_detection": ["region1", "region2", "region3", "region4", "region5"],
+  "detection_config": {
+    "sub_region_coords": {
+      "x1": 60,
+      "x2": 120,
+      "y1": 46,
+      "y2": 50
+    },
+    "white_pixel_threshold": 0.02,
+    "description": "如果子區域白色像素比例超過2%，判定為運作值（大數字）；否則為設定值（小數字）"
+  },
+  "regions_without_setting_detection": ["region6", "region7"],
+  "default_setting_value": false
+}

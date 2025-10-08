@@ -1,0 +1,35 @@
+{
+  "PEDAL": {
+    "1": "踏板 0",
+    "2": "踏板 1",
+    "3": "踏板 2",
+    "4": "踏板 3"
+  },
+  "STAGE": {
+    "1": "Quad",
+    "2": "Sculpt",
+    "3": "Visco",
+    "4": "Centration",
+    "5": "Position",
+    "6": "Capsulorhexis",
+    "7": "Incision",
+    "8": "End Case",
+    "9": "Coag 1",
+    "10": "Coag 2",
+    "11": "AutoSert",   
+    "12": "Fill",
+    "13": "Irr F/S",
+    "14": "Polish",
+    "15": "Epi",
+    "16": "Toric",
+    "17": "Aphakic",
+    "18": "Flip",
+    "19": "Chop",
+    "20": "Registration",
+    "21": "Axis Marker",
+    "22": "PrePhaco",
+    "23": "Pseudophakic",
+    "24": "Cortex",
+    "25": "UltraChop"
+  }
+}

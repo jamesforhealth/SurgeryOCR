@@ -63,13 +63,14 @@ class EasyOCRModel(BaseOCRModel):
                 print(f"使用最少參數初始化 EasyOCR Reader 失敗: {fallback_e}")
                 raise e # 重新拋出原始錯誤
         
-    def recognize(self, image):
+    def recognize(self, image, allowlist=None):
         """
         使用EasyOCR識別圖像中的文字。
         此方法包含置信度過濾、按x座標排序和文本拼接。
         
         參數:
             image: 輸入圖像，numpy數組 (BGR) 或 PIL.Image
+            allowlist: (可選) 覆蓋本次識別的字符白名單
             
         返回:
             result: 字符串，識別結果
@@ -88,6 +89,9 @@ class EasyOCRModel(BaseOCRModel):
         elif not isinstance(image, np.ndarray):
             raise TypeError("輸入圖像必須是 PIL.Image 或 numpy.ndarray 類型")
 
+        # 決定本次調用使用的allowlist
+        current_allowlist = allowlist if allowlist is not None else self.allowlist
+
         if self.debug_output:
             print(f"\n{'='*60}")
             print(f"🔍 EasyOCR 模型調用開始")
@@ -96,12 +100,13 @@ class EasyOCRModel(BaseOCRModel):
             print(f"   - 尺寸: {image.shape}")
             print(f"   - 數據類型: {image.dtype}")
             print(f"   - 像素值範圍: [{image.min()}, {image.max()}]")
+            print(f"   - 使用 allowlist: '{current_allowlist}'")
 
         # 執行OCR - 獲取最原始的模型輸出
         try:
             ocr_results = self.reader.readtext(
                 image,
-                allowlist=self.allowlist, # 在 readtext 中使用存儲的 allowlist
+                allowlist=current_allowlist, # 在 readtext 中使用存儲的 allowlist
                 detail=1,
                 paragraph=False,
                 width_ths=0.7,  # 添加更多參數以獲得更詳細的控制
@@ -142,7 +147,7 @@ class EasyOCRModel(BaseOCRModel):
                         print(f"       🗂️  bbox: {bbox}")
                         
                         # 如果字符在白名單之外，也顯示警告
-                        invalid_chars = [c for c in text if c not in self.allowlist and c != ' ']
+                        invalid_chars = [c for c in text if c not in current_allowlist and c != ' ']
                         if invalid_chars:
                             print(f"       ⚠️  包含白名單外字符: {invalid_chars}")
             
@@ -214,7 +219,7 @@ class EasyOCRModel(BaseOCRModel):
             
         return text, avg_confidence
     
-    def recognize_with_raw_output(self, image):
+    def recognize_with_raw_output(self, image, allowlist=None):
         """
         擴展版的識別方法，返回完整的原始輸出
         
@@ -222,7 +227,7 @@ class EasyOCRModel(BaseOCRModel):
             tuple: (final_text, avg_confidence, raw_results)
         """
         # 先執行標準識別
-        final_text, avg_confidence = self.recognize(image)
+        final_text, avg_confidence = self.recognize(image, allowlist=allowlist)
         
         # 再次執行OCR以獲取原始結果（如果需要避免重複處理，可以修改recognize方法來緩存結果）
         if isinstance(image, Image.Image):
@@ -231,9 +236,10 @@ class EasyOCRModel(BaseOCRModel):
             else:
                 image = np.array(image)
         
+        current_allowlist = allowlist if allowlist is not None else self.allowlist
         raw_results = self.reader.readtext(
             image,
-            allowlist=self.allowlist,
+            allowlist=current_allowlist,
             detail=1,
             paragraph=False
         )

@@ -74,8 +74,9 @@ import matplotlib.pyplot as plt
 
 # --- Core API Import ---
 from extract_roi_images import process_video_frames
-from utils.get_configs import load_roi_config, load_stage_config, load_roi_header_config
+from utils.get_configs import load_roi_config, load_stage_config, load_roi_header_config, load_ocr_char_sets_config, load_setting_regions_config
 from utils.get_analysis_results import get_stage_analysis_json
+
 SINGLE_DIGIT_BORDER = 40        # px 左右黑邊寬度門檻
 SINGLE_DIGIT_THRESH = 0.03      # 左或右 >3% 白點 ⇒ 不是單一數字
 # ---------------------------------------------------------------------------
@@ -272,9 +273,9 @@ def active_in_stage(
     """Check if OCR should be active for the given frame and region based on stage config and header cache img"""
 
     # Header檢測（如果有frame數據和header配置）
-    # if current_frame is not None and roi_header_dict:
-    if not _is_active_header(current_frame, region_name, roi_header_dict, frame_idx):
-        return False  # Header not active means always inactive
+    if current_frame is not None and roi_header_dict:
+        if not _is_active_header(current_frame, region_name, roi_header_dict, frame_idx):
+            return False  # Header not active means always inactive
     
     if not stage_activation_dict:
         return True  # No config is considered as always active
@@ -325,6 +326,80 @@ def active_by_header_detection(
     return detect_header_presence(frame, header_coords, region_name, diff_threshold)
 
 
+def determine_if_setting_value(
+    ocr_text: str, 
+    binary_image: np.ndarray, 
+    region_name: str, 
+    frame_idx: int
+) -> bool:
+    """
+    判斷單一數值的情況下是否為設定值
+    
+    Args:
+        ocr_text: OCR識別的文字
+        binary_image: 二值化後的圖像
+        region_name: 區域名稱
+        frame_idx: 幀編號
+    
+    Returns:
+        True if 設定值, False if 運作值
+    
+    判斷邏輯：
+    1. 載入設定區域配置
+    2. 如果區域不在需要判斷的列表中，返回預設值
+    3. 分析指定子區域的白色像素比例
+    4. 比例超過閾值則為運作值（大數字），否則為設定值（小數字）
+    """
+    
+    # 載入配置
+    config = load_setting_regions_config()
+    
+    # 檢查是否需要進行設定值檢測
+    regions_with_detection = config.get("regions_with_setting_detection", [])
+    if region_name not in regions_with_detection:
+        # 不在檢測列表中的區域，返回預設值
+        return config.get("default_setting_value", False)
+    
+    # 取得檢測配置
+    detection_config = config.get("detection_config", {})
+    sub_coords = detection_config.get("sub_region_coords", {})
+    threshold = detection_config.get("white_pixel_threshold", 0.02)
+    
+    # 檢查子區域座標配置
+    if not all(key in sub_coords for key in ["x1", "x2", "y1", "y2"]):
+        print(f"警告: {region_name} 缺少子區域座標配置，使用預設值")
+        return config.get("default_setting_value", False)
+    
+    # 取得子區域座標
+    x1, x2 = sub_coords["x1"], sub_coords["x2"]
+    y1, y2 = sub_coords["y1"], sub_coords["y2"]
+    
+    # 檢查座標是否在圖像範圍內
+    h, w = binary_image.shape[:2]
+    if x2 > w or y2 > h or x1 < 0 or y1 < 0:
+        print(f"警告: {region_name} 子區域座標 ({x1},{y1},{x2},{y2}) 超出圖像範圍 ({w},{h})")
+        return config.get("default_setting_value", False)
+    
+    # 裁切子區域
+    sub_region = binary_image[y1:y2, x1:x2]
+    
+    if sub_region.size == 0:
+        print(f"警告: {region_name} 子區域為空")
+        return config.get("default_setting_value", False)
+    
+    # 計算白色像素比例
+    white_pixels = np.sum(sub_region > 0)  # 二值化圖像中白色像素（值>0）
+    total_pixels = sub_region.size
+    white_ratio = white_pixels / total_pixels if total_pixels > 0 else 0
+    
+    # 判斷：白色比例超過閾值則為運作值（大數字），否則為設定值（小數字）
+    is_operation_value = white_ratio > threshold
+    
+    # 可選：輸出除錯資訊
+    # print(f"[DEBUG] {region_name} frame {frame_idx}: 白色比例={white_ratio:.4f}, 閾值={threshold:.4f}, 判斷={'運作值' if is_operation_value else '設定值'}")
+    
+    return not is_operation_value  # 返回 True 表示設定值，False 表示運作值
+
 
 def process_video(
     video_path: Path,
@@ -333,7 +408,8 @@ def process_video(
     diff_thresh: float = 0.01,
     save_dir: Path | None = None,
     stage_activation_dict: Dict[str, List[int]] | None = None,
-    roi_header_dict: Dict[str, List[int]] | None = None
+    roi_header_dict: Dict[str, List[int]] | None = None,
+    char_sets_dict: Dict[str, str] | None = None
 ) -> None:
     """
     對單一影片的所有指定ROI區域進行變化檢測與OCR。
@@ -346,6 +422,9 @@ def process_video(
 
     stage_analysis_dict = get_stage_analysis_json( save_dir / "stage_analysis.json")
 
+    if not char_sets_dict:
+        char_sets_dict = {}
+
     # --- 初始化 ---
     ocr_iface = get_ocr_model(
         model_type="easyocr",
@@ -357,6 +436,7 @@ def process_video(
     
     # 為每個ROI區域維護獨立的狀態
     prev_bins = {}  # type: Dict[str, np.ndarray | None]
+    prev_active_states = {}  # type: Dict[str, bool | None] # 追蹤前一幀的activate狀態
     
     # 用於分組結果的新數據結構
     multi_digit_groups = {region_name: [] for region_name, _ in rois}
@@ -392,11 +472,32 @@ def process_video(
 
         for region_name, roi_data in rois_data.items():
             curr_bin = roi_data["binary_np"]
-            prev_bin = prev_bins.get(region_name) 
+            prev_bin = prev_bins.get(region_name)
             
-            if not active_in_stage(stage_analysis_dict, stage_activation_dict, roi_header_dict, frame_idx, region_name, original_frame):
-                prev_bins[region_name] = curr_bin
-                continue # 跳過沒有activate該region的時間區段
+            # 檢查當前幀的activate狀態
+            current_active = active_in_stage(stage_analysis_dict, stage_activation_dict, roi_header_dict, frame_idx, region_name, original_frame)
+            prev_active = prev_active_states.get(region_name)
+            
+            # 檢測 activate → deactivate 轉換
+            if prev_active is True and current_active is False:
+                # 記錄deactivate事件
+                single_digit_results[region_name].append({
+                    "type": "deactivate",
+                    "frame": frame_idx,
+                    "ocr_text": "(Deactivated)",
+                    "confidence": 1.0,
+                    "setting": False  # deactivate事件不是設定值
+                })
+                stats[region_name]["change_count"] += 1
+                print(f"檢測到 {region_name} 在frame {frame_idx} 從activate轉為deactivate")
+            
+            # 更新狀態
+            prev_bins[region_name] = curr_bin
+            prev_active_states[region_name] = current_active
+            
+            # 如果當前幀不是active，跳過後續OCR處理
+            if not current_active:
+                continue
 
             change = False
             if prev_bin is None:
@@ -428,14 +529,16 @@ def process_video(
                 #     input(f"is_multi_digit: {is_multi_digit}, from_cache: {from_cache}")
                 # --- Step 2: 如果不在快取中，則執行OCR ---
                 if not from_cache:
-                    ocr_result, confidence = ocr_iface.recognize(Image.fromarray(curr_bin))
+                    # 根據 region 獲取特定的 allowlist，如果沒有則為 None (使用模型預設值)
+                    custom_allowlist = char_sets_dict.get(region_name)
+                    ocr_result, confidence = ocr_iface.recognize(Image.fromarray(curr_bin), allowlist=custom_allowlist)
                     ocr_calls_in_frame += 1
 
                     # --- 後備方案：如果OCR失敗，嘗試裁切 ---
                     if not ocr_result:
                         trimmed_bin = trim_black_borders(curr_bin, max_border=1)
                         if trimmed_bin.size > 0 and trimmed_bin.shape != curr_bin.shape:
-                            ocr_result, confidence = ocr_iface.recognize(Image.fromarray(trimmed_bin))
+                            ocr_result, confidence = ocr_iface.recognize(Image.fromarray(trimmed_bin), allowlist=custom_allowlist)
                             ocr_calls_in_frame += 1
                     
                     # --- Step 3: 記錄新結果 ---
@@ -446,17 +549,21 @@ def process_video(
                                 "source_frame": frame_idx,
                                 "ocr_text": ocr_result,
                                 "confidence": confidence,
-                                "matched_frames": [frame_idx]
+                                "matched_frames": [frame_idx],
+                                "setting": True  # multi_digit_group 總是設定值
                             }
                             multi_digit_groups[region_name].append(new_group)
                             new_group_index = len(multi_digit_groups[region_name]) - 1
                             cache_map[region_name].append((curr_bin, new_group_index))
                     else: # 單數字
+                        # TODO: 添加設定值判斷邏輯，目前預設為運作值
+                        is_setting_value = determine_if_setting_value(ocr_result, curr_bin, region_name, frame_idx)
                         single_digit_results[region_name].append({
                             "type": "single_digit",
                             "frame": frame_idx,
                             "ocr_text": ocr_result,
-                            "confidence": confidence
+                            "confidence": confidence,
+                            "setting": is_setting_value
                         })
 
                 ocr_elapsed = time.perf_counter() - t1
@@ -633,6 +740,7 @@ def parse_args() -> argparse.Namespace:  # pragma: no cover
     p.add_argument("--region", default="all", help="ROI name as in ROI config (e.g. region2)")
     p.add_argument("--roi-config", type=Path, default=Path("config/rois.json"), help="ROI config JSON path")
     p.add_argument("--stage-config", type=Path, default=Path("config/ocr_activation_stages.json"), help="Stage config JSON path")
+    p.add_argument("--char-config", type=Path, default=Path("config/ocr_char_sets.json"), help="OCR character sets JSON path")
     p.add_argument("--method", choices=["otsu", "rule"], default="rule", help="Binarisation method")
     p.add_argument("--diff-thresh", type=float, default=0.01, help="Diff ratio threshold (0‑1) to flag change")
     p.add_argument("--save-dir", type=Path, help="Directory to save jsonl (defaults to video directory)")
@@ -643,7 +751,10 @@ def main():  # pragma: no cover
     args = parse_args()
     roi_dict = load_roi_config(args.roi_config)
     stage_activation_dict = load_stage_config(args.stage_config)
-    
+    char_sets_dict = load_ocr_char_sets_config(args.char_config)
+    if char_sets_dict:
+        print(f"載入 custom OCR character sets 成功: {list(char_sets_dict.keys())}")
+
     # 嘗試載入header配置
     roi_header_dict = {}
     try:
@@ -671,13 +782,13 @@ def main():  # pragma: no cover
             print(f"Processing video: {video_file}")
             process_video(
                 video_file, rois, args.method, args.diff_thresh, args.save_dir, 
-                stage_activation_dict, roi_header_dict
+                stage_activation_dict, roi_header_dict, char_sets_dict
             )
 
     elif str(args.video)[-4:].lower() == ".mp4":
         process_video(
             args.video, rois, args.method, args.diff_thresh, args.save_dir, 
-            stage_activation_dict, roi_header_dict
+            stage_activation_dict, roi_header_dict, char_sets_dict
         )
 
 
