@@ -42,8 +42,9 @@ data/*
 
 components/
 # 忽略一些暫時用不上的模型相關檔案
-models/*.py
 models/*.csv
+models/*.py
+models/*.pth
 models/simple_OCR_models2/
 models/simple_OCR_models3/
 models/frame_change_detector/
