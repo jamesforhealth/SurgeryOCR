@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 import time
 import numpy as np
 from dataclasses import dataclass # 新增
-
+import sys
 import cv2
 from PIL import Image, ImageTk, ImageDraw
 import tkinter as tk
@@ -323,7 +323,14 @@ class VideoAnnotator(tk.Frame):
 
     def _create_widgets(self):
         """創建 GUI 界面元素"""
-        matplotlib.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS']
+        if sys.platform == "darwin": # darwin 是 macOS 的核心名稱
+            # macOS 推薦字型
+            font_names = ['PingFang TC', 'Arial Unicode MS']
+        else:
+            # Windows 或其他系統的字型
+            font_names = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS']
+        
+        matplotlib.rcParams['font.sans-serif'] = font_names
         matplotlib.rcParams['axes.unicode_minus'] = False
         
         # 初始化變數（需要在UI創建前）
