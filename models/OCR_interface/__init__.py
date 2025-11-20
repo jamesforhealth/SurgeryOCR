@@ -2,21 +2,7 @@
 OCR模型接口包 - 簡潔統一的OCR接口
 """
 from .base import BaseOCRModel
-from .easyocr_model import EasyOCRModel
-import torch
 import os
-
-# 檢查CRNN模型所需的依賴是否可用
-try:
-    from .simpleocr_model import CRNNModel
-    has_crnn = True
-except ImportError as e:
-    print(f"DEBUG: 在 __init__.py 中導入 '.simpleocr_model' 時捕獲到 ImportError: {e}")
-    print(f"DEBUG: 這通常意味著 simpleocr_model.py 或其依賴 (如 pretrain_crnn.py) 導入失敗。")
-    has_crnn = False
-except Exception as ex:
-    print(f"DEBUG: 在 __init__.py 中導入 '.simpleocr_model' 時捕獲到非 ImportError 的異常: {ex}")
-    has_crnn = False
 
 # 預訓練模型路徑配置
 PRETRAINED_MODELS = {
@@ -39,11 +25,24 @@ def get_ocr_model(model_type="easyocr", pretrained=None, debug_output=True, **kw
         OCR模型實例
     """
     if model_type.lower() == "easyocr":
+        from .easyocr_model import EasyOCRModel
+
         # 將debug_output參數傳遞給EasyOCRModel
         kwargs['debug_output'] = debug_output
         return EasyOCRModel(**kwargs)
     
     elif model_type.lower() == "crnn":
+        # 檢查CRNN模型所需的依賴是否可用
+        try:
+            from .simpleocr_model import CRNNModel
+            has_crnn = True
+        except ImportError as e:
+            print(f"DEBUG: 在 __init__.py 中導入 '.simpleocr_model' 時捕獲到 ImportError: {e}")
+            print(f"DEBUG: 這通常意味著 simpleocr_model.py 或其依賴 (如 pretrain_crnn.py) 導入失敗。")
+            has_crnn = False
+        except Exception as ex:
+            print(f"DEBUG: 在 __init__.py 中導入 '.simpleocr_model' 時捕獲到非 ImportError 的異常: {ex}")
+            has_crnn = False
         if not has_crnn:
             raise ImportError("使用CRNN模型需要安裝PyTorch (或者其依賴導入失敗，請查看上面的 DEBUG 信息)")
         

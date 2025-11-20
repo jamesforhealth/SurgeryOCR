@@ -51,3 +51,8 @@ models/simple_OCR_models3/
 models/frame_change_detector/
 !models/OCR_interface/
 !models/OCR_interface/**
+
+#build executables
+build/
+dist/
+release_env/

@@ -13,7 +13,9 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from utils.get_configs import load_diff_rules, load_pattern_name_mapping
+from extract_frame_cache import iterate_frames, get_frame_cache_dir
+from utils.get_configs import load_diff_rules, load_pattern_name_mapping, read_surgery_stage_rois
+from utils.get_paths import resolve_video_analysis_dir
 
 
 # -----------------------------
@@ -42,11 +44,6 @@ def debug_pause(args: argparse.Namespace, message: str):
     """如果啟用互動模式，則暫停程式"""
     if args.interactive:
         input(f"    └── ⏸️  {message} (按 Enter 繼續)...")
-
-def read_surgery_stage_rois(path: Path) -> Dict[str, List[int]]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
 
 def binarize_otsu(image_rgb: np.ndarray) -> np.ndarray:
     """Return a 2D uint8 binary image (0/255) using OTSU on gray."""
@@ -228,9 +225,6 @@ def build_segments(
     start: Optional[int] = None
     rmse_values: List[float] = []
 
-    if current_pattern is None:
-        return []
-
     def close_segment(end_frame: int):
         nonlocal segments, start, current_pattern, rmse_values
         if current_pattern is not None:
@@ -247,10 +241,26 @@ def build_segments(
             rmse_values = []
 
     for frame_idx, pattern_id, rmse in matches:
+        # None 視為空白區段，會中斷任何正在進行的片段
+        if pattern_id is None:
+            close_segment(frame_idx - 1)
+            current_pattern = None
+            start = None
+            rmse_values = []
+            continue
+
+        if current_pattern is None:
+            current_pattern = pattern_id
+            start = frame_idx
+            if rmse is not None:
+                rmse_values.append(rmse)
+            continue
+
         if pattern_id != current_pattern:
             close_segment(frame_idx - 1)
             current_pattern = pattern_id
             start = frame_idx
+            rmse_values = []
             if rmse is not None:
                 rmse_values.append(rmse)
         else:
@@ -348,6 +358,95 @@ def analyze_pedal_frame(
         return pid, rmse
 
 
+# --------------------------------------------------------------------------
+# [NEW] StageAnalyzer Class for Pipeline Integration
+# --------------------------------------------------------------------------
+class StageAnalyzer:
+    def __init__(self, roi_config_path: Path, cache_dir: Path, debug: bool = False):
+        self.roi_config_path = roi_config_path
+        self.cache_dir = cache_dir
+        self.debug = debug
+        
+        # 載入配置
+        self.roi_dict = read_surgery_stage_rois(roi_config_path)
+        self.diff_rules = load_diff_rules()
+        
+        # 載入 Patterns
+        self.region_to_patterns: Dict[str, List[RegionPattern]] = {
+            region: load_region_patterns(cache_dir, region) for region in self.roi_dict.keys()
+        }
+        
+        # 狀態變數
+        self.prev_frame_rois: Dict[str, Optional[np.ndarray]] = {r: None for r in self.roi_dict}
+        
+        # 專門為 PEDAL 優化準備的狀態
+        # 我們需要維護 analyze_pedal_frame 的內部狀態 (prev_match_result)
+        # 為了避免多個實例互相干擾，我們將狀態存在 instance 中
+        self.pedal_prev_match = (None, None) # (pid, rmse)
+    
+    def process_frame(self, frame_bgr: np.ndarray, frame_idx: int, rmse_threshold: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        處理單一幀，回傳該幀各區域的匹配結果。
+        Returns:
+            {
+                "STAGE": {"pattern_id": 1, "rmse": 12.5},
+                "PEDAL": {"pattern_id": None, "rmse": None},
+                ...
+            }
+        """
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = {}
+        
+        # 使用 argparse.Namespace 來模擬原本 args 傳遞給輔助函數
+        mock_args = argparse.Namespace(debug_pedal=self.debug, interactive=False)
+
+        for region_name, coords in self.roi_dict.items():
+            region_config = self.diff_rules.get(region_name, {})
+            # 優先使用傳入的 global threshold，否則使用 config 中的設定
+            threshold = rmse_threshold if rmse_threshold is not None else region_config.get("diff_threshold", 30.0)
+
+            x1, y1, x2, y2 = map(int, coords)
+            h, w = frame_rgb.shape[:2]
+            
+            # 邊界檢查
+            if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+                if self.debug:
+                    print(f"[警告] ROI 座標無效 {region_name}: {(x1,y1,x2,y2)} 超出畫面範圍 {(w,h)}，跳過")
+                results[region_name] = {"pattern_id": None, "rmse": None}
+                continue
+                
+            roi_rgb = frame_rgb[y1:y2, x1:x2]
+            
+            pid, rmse = None, None
+            
+            if region_name == "PEDAL":
+                # 注入狀態
+                analyze_pedal_frame.prev_match_result = self.pedal_prev_match
+                
+                pid, rmse = analyze_pedal_frame(
+                    roi_rgb, self.prev_frame_rois[region_name],
+                    self.region_to_patterns.get(region_name, []),
+                    region_config, mock_args, frame_idx
+                )
+                
+                # 保存狀態
+                self.pedal_prev_match = analyze_pedal_frame.prev_match_result
+                self.prev_frame_rois[region_name] = roi_rgb.copy()
+                
+            else:
+                cand_array = get_analysis_candidate(roi_rgb, region_name, region_config, mock_args, frame_idx)
+                patterns = self.region_to_patterns.get(region_name, [])
+                if patterns:
+                    pid, rmse = match_best_pattern(
+                        cand_array, patterns, threshold, mock_args, frame_idx,
+                        region_name=region_name, region_config=region_config
+                    )
+            
+            results[region_name] = {"pattern_id": pid, "rmse": rmse}
+            
+        return results
+
+
 def analyse_video(
     video_path: Path,
     *,
@@ -359,95 +458,99 @@ def analyse_video(
 ) -> Path:
     """對單一影片進行分析"""
     
-    diff_rules = load_diff_rules()
+    # 使用新的 StageAnalyzer Class
+    analyzer = StageAnalyzer(roi_config_path, cache_dir, debug=args.debug_pedal)
+    
+    # 簡易取得影片資訊
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise SystemExit(f"無法開啟影片: {video_path}")
-
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
 
-    roi_dict = read_surgery_stage_rois(roi_config_path)
-    region_to_patterns: Dict[str, List[RegionPattern]] = {
-        region: load_region_patterns(cache_dir, region) for region in roi_dict.keys()
-    }
-
-    region_matches: Dict[str, List[Tuple[int, Optional[int], Optional[float]]]] = {r: [] for r in roi_dict}
-    
-    # 儲存前一幀的 ROI 圖像（用於 PEDAL 前後幀比較）
-    prev_frame_rois: Dict[str, Optional[np.ndarray]] = {r: None for r in roi_dict}
+    region_matches: Dict[str, List[Tuple[int, Optional[int], Optional[float]]]] = {r: [] for r in analyzer.roi_dict}
     
     print(f"🚀 開始使用「優化的 PEDAL 前後幀比較法」分析影片: {video_path.name}")
     if args.debug_pedal:
         print("🕵️  已啟用 PEDAL 偵錯模式。")
-        print("📋 PEDAL 分析策略：")
-        print("    1. 第一幀：直接與 cache 比對")
-        print("    2. 後續幀：先與前一幀比較差異")
-        print("    3. 差異 > 30：進行 cache 比對")
-        print("    4. 差異 ≤ 30：沿用前一幀的結果")
 
     frames_to_process = total_frames
     if args.debug_pedal:
-        frames_to_process = 50  # 增加到 50 幀以便觀察變化
+        frames_to_process = 50
         print(f"⚠️  偵錯模式下，僅處理前 {frames_to_process} 幀以加速除錯。")
 
-    for frame_idx in range(frames_to_process):
-        ret, frame_bgr = cap.read()
-        if not ret:
-            break
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    # 優先使用 frame_cache（若存在），否則回退到直接讀取影片
+    cache_path = get_frame_cache_dir(video_path)
+    cache_has_files = cache_path.exists() and any(cache_path.glob("frame_*.jpg"))
+    
+    if cache_has_files:
+        print(f"[訊息] 使用 frame_cache 來源: {cache_path}")
+        frame_source = iterate_frames(video_path)
+    else:
+        # 嘗試從 extract_frame_cache 導入 generator，如果失敗則使用本地簡單邏輯
+        try:
+            from extract_frame_cache import video_frame_generator
+            frame_source = video_frame_generator(video_path)
+        except ImportError:
+            # Fallback: 簡單的 generator
+            def simple_gen():
+                c = cv2.VideoCapture(str(video_path))
+                i = 0
+                while True:
+                    r, f = c.read()
+                    if not r: break
+                    if f is not None and f.size > 0:
+                        yield i, f
+                    i += 1
+                c.release()
+            frame_source = simple_gen()
 
+    # 統一的處理迴圈
+    for frame_idx, frame_bgr in frame_source:
+        if args.debug_pedal and frame_idx >= frames_to_process:
+            break
+            
         if frame_idx > 0 and frame_idx % 1000 == 0:
             print(f"  ... 正在處理幀 {frame_idx}/{total_frames}")
 
-        for region_name, coords in roi_dict.items():
-            is_pedal_debug = args.debug_pedal and region_name == "PEDAL"
-            region_config = diff_rules.get(region_name, {})
-            threshold = rmse_threshold if rmse_threshold is not None else region_config.get("diff_threshold", 30.0)
+        # 使用 Analyzer 處理
+        results = analyzer.process_frame(frame_bgr, frame_idx, rmse_threshold)
+        
+        # 收集結果
+        for region_name, res in results.items():
+            region_matches[region_name].append((frame_idx, res['pattern_id'], res['rmse']))
 
-            x1, y1, x2, y2 = map(int, coords)
-            roi_rgb = frame_rgb[y1:y2, x1:x2]
-            
-            if region_name == "PEDAL":
-                # PEDAL 區域使用新的前後幀比較策略
-                pid, rmse = analyze_pedal_frame(
-                    roi_rgb, prev_frame_rois[region_name], 
-                    region_to_patterns.get(region_name, []),
-                    region_config, args, frame_idx
-                )
-                # 更新前一幀的 ROI
-                prev_frame_rois[region_name] = roi_rgb.copy()
-            else:
-                # 其他區域維持原有邏輯
-                if is_pedal_debug:
-                    print("="*50)
-                    print(f"[PEDAL DEBUG] Frame {frame_idx} | 步驟 1: 裁切原始 ROI")
-                    print(f"    - ROI 尺寸: {roi_rgb.shape}")
-
-                cand_array = get_analysis_candidate(roi_rgb, region_name, region_config, args, frame_idx)
-                
-                patterns = region_to_patterns.get(region_name, [])
-                pid, rmse = match_best_pattern(
-                    cand_array, patterns, threshold, args, frame_idx,
-                    region_name=region_name, region_config=region_config
-                )
-            
-            region_matches[region_name].append((frame_idx, pid, rmse))
-
-    cap.release()
     print("✅ 逐幀分析完成，開始建立區段...")
 
     regions_output: Dict[str, List[Dict[str, float]]] = {}
     for region_name, matches in region_matches.items():
+        # 保險：按 frame_idx 排序，避免任何來源造成的錯序
+        matches.sort(key=lambda t: t[0])
         # 使用新的 build_segments 函數
         region_pattern_map = load_pattern_name_mapping(Path("config/pattern_name_mapping.json")).get(region_name, {})
         segments = build_segments(matches, region_pattern_map)
+        # 額外防護：修正可能的負 frame_count 與錯位 end/start
+        cleaned_segments: List[Dict[str, Any]] = []
+        for seg in segments:
+            s = int(seg.get("start_frame", 0))
+            e = int(seg.get("end_frame", s))
+            if e < s:
+                # 以 s 作為 fallback，避免負值
+                e = s
+            fc = max(0, e - s + 1)
+            seg["start_frame"] = s
+            seg["end_frame"] = e
+            seg["frame_count"] = fc
+            cleaned_segments.append(seg)
+        segments = cleaned_segments
         regions_output[region_name] = segments
+        non_null = sum(1 for _, pid, _ in matches if pid is not None)
+        print(f"[診斷] 區域 {region_name}: 匹配幀數 {non_null} / {len(matches)}，段落數 {len(segments)}")
 
     video_name = video_path.stem
     if output_dir is None:
-        output_dir = Path("data") / video_name
+        # 使用統一的路徑解析邏輯，支持子目錄結構
+        output_dir = resolve_video_analysis_dir(video_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "stage_analysis.json"
 
@@ -473,6 +576,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, help="輸出資料夾 (預設: data/<video_name>)；若為資料夾模式將分別輸出至各自的 data/<video_name>/")
     p.add_argument("--debug-pedal", action="store_true", help="啟用針對 PEDAL 區域的詳細偵錯模式")
     p.add_argument("--interactive", action="store_true", help="在偵錯模式下啟用互動式暫停 (需搭配 --debug-pedal)")
+    p.add_argument("--force", action="store_true", help="強制重新分析，忽略已存在的 stage_analysis.json")
+    p.add_argument("--use-stream", action="store_true", help="強制使用串流讀取模式 (不依賴 disk cache)")
     return p.parse_args()
 
 
@@ -488,18 +593,32 @@ def main() -> None:
         print(f"🔎 在資料夾中找到 {len(video_files)} 支影片，開始逐一分析...")
         for idx, vf in enumerate(video_files, start=1):
             print(f"\n[{idx}/{len(video_files)}] 分析影片: {vf.name}")
+            # 計算預期輸出路徑，若存在且未指定 --force 則跳過
+            expected_out_dir = args.output_dir if args.output_dir else resolve_video_analysis_dir(vf)
+            expected_out_path = expected_out_dir / "stage_analysis.json"
+            if expected_out_path.exists() and not args.force:
+                print(f"⏭️  偵測到已存在: {expected_out_path}，使用 --force 可強制重跑，已跳過。")
+                continue
+
             analyse_video(
                 vf,
                 roi_config_path=args.roi_config,
                 cache_dir=args.cache_dir,
                 rmse_threshold=args.threshold,
-                output_dir=None,
+                output_dir=args.output_dir,  # 目錄模式也尊重傳入的 output_dir
                 args=args,
             )
         print("\n✅  所有影片分析完成")
         return
 
     if str(target).lower().endswith(".mp4"):
+        # 計算預期輸出路徑，若存在且未指定 --force 則提示並跳過
+        expected_out_dir = args.output_dir if args.output_dir else resolve_video_analysis_dir(target)
+        expected_out_path = expected_out_dir / "stage_analysis.json"
+        if expected_out_path.exists() and not args.force:
+            print(f"⏭️  偵測到已存在: {expected_out_path}，使用 --force 可強制重跑，已跳過。")
+            return
+
         analyse_video(
             target,
             roi_config_path=args.roi_config,
