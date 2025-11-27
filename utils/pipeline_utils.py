@@ -12,26 +12,29 @@ class AsyncImageSaver:
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
         self.total_saved = 0
+        self._created_dirs = set()
 
     def save(self, img: np.ndarray, path: Path, params=None):
         """非同步儲存圖片"""
         if img is None or img.size == 0:
             return
-        self.queue.put((img.copy(), path, params))
+        self.queue.put((img.copy(), Path(path), params))
 
     def _worker(self):
         while not self.stop_event.is_set() or not self.queue.empty():
             try:
                 item = self.queue.get(timeout=0.1)
                 img, path, params = item
-                path = Path(path)
                 
                 # 確保目錄存在
-                if not path.parent.exists():
+                parent = path.parent
+                parent_key = str(parent)
+                if parent_key not in self._created_dirs:
                     try:
-                        path.parent.mkdir(parents=True, exist_ok=True)
+                        parent.mkdir(parents=True, exist_ok=True)
                     except OSError:
-                        pass # 忽略並發建立目錄時的錯誤
+                        pass
+                    self._created_dirs.add(parent_key)
                 
                 try:
                     suffix = path.suffix.lower() or ".png"

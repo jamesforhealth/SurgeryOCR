@@ -1,75 +1,106 @@
 from __future__ import annotations
+import math
 import cv2
 import numpy as np
 from PIL import Image
 
-def binarize(image_bgr: np.ndarray, method: str = "rule", *,
-             hsv_s_thresh: int = 30, gray_thresh: int = 150) -> np.ndarray:
+def binarize(image_bgr: np.ndarray, hsv_s_thresh: int = 30, gray_thresh: int = 150) -> np.ndarray:
     """Return a binary (uint8 0/255) image."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    if method == "otsu":
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        return binary
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    sat = hsv[..., 1]
+    sat_limit = np.clip(hsv_s_thresh, 0, 100)
+    sat_threshold = int(round((sat_limit / 100.0) * 255))
 
-    if method == "rule":
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        h, s, v = cv2.split(hsv)
-        s_pct = (s / 255.0) * 100
-        mask = (s_pct < hsv_s_thresh) & (gray > gray_thresh)
-        binary = np.zeros_like(gray, dtype=np.uint8)
-        binary[mask] = 255
-        return binary
+    _, low_sat_mask = cv2.threshold(sat, sat_threshold, 255, cv2.THRESH_BINARY_INV)
+    _, bright_mask = cv2.threshold(gray, gray_thresh, 255, cv2.THRESH_BINARY)
+    binary = cv2.bitwise_and(low_sat_mask, bright_mask)
+    return binary
 
     raise ValueError(f"Unsupported binarisation method: {method}") 
 
-def binarize_pil(image: Image.Image, method: str = "rule", *,
-             hsv_s_thresh: int = 30, gray_thresh: int = 150) -> np.ndarray:
+def binarize_pil(image: Image.Image) -> np.ndarray:
     """Return a binary (uint8 0/255) image."""
     image_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    binary = binarize(image_bgr, method)
+    binary = binarize(image_bgr)
     return binary
 
+
+def calculate_rmse(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape:
+        print(f"    [DEBUG] 🔴 錯誤: 形狀不匹配! 圖像A: {a.shape}, 圖像B: {b.shape}")
+        return float("inf")
+    diff = cv2.norm(a, b, cv2.NORM_L2)
+    return float(diff / math.sqrt(a.size))
+
+def calculate_ndarray_diff(a: np.ndarray, b: np.ndarray, sub_roi_coords: List[int]) -> float:
+    """計算兩張 ndarray 圖像在指定精細區域內的平均RGB顏色差異"""
+    try:
+        x1, y1, x2, y2 = sub_roi_coords
+        
+        # 從兩張圖像中裁剪出精細區域
+        a_sub_roi = a[y1:y2, x1:x2]
+        b_sub_roi = b[y1:y2, x1:x2]
+        
+        # 檢查尺寸是否一致
+        if a_sub_roi.shape != b_sub_roi.shape:
+            return 0.0
+        
+        rmse = calculate_rmse(a_sub_roi, b_sub_roi)
+        return rmse
+        
+    except Exception as e:
+        print(f"計算 ndarray 圖像差異時出錯: {e}")
+        return 0.0
 
 def calculate_roi_diff(prev_img: Image.Image, curr_img: Image.Image, coords: Tuple[int, int, int, int]) -> tuple[float, np.ndarray | None]:
     """Calculate the difference between two ROI images."""
     try:
-        # 從兩張圖像中裁剪出精細區域
         prev_sub_roi = prev_img.crop(coords)
         curr_sub_roi = curr_img.crop(coords)
-        
-        # 轉換為 NumPy 數組
-        prev_arr = np.array(prev_sub_roi).astype(np.float32)
-        curr_arr = np.array(curr_sub_roi).astype(np.float32)
-        
-        # 檢查尺寸是否一致
+
+        prev_arr = np.asarray(prev_sub_roi, dtype=np.float32)
+        curr_arr = np.asarray(curr_sub_roi, dtype=np.float32)
+
         if prev_arr.shape != curr_arr.shape:
             return 0.0, None
-        
-        # 計算每個像素RGB通道差值的平方
-        squared_diff = np.square(prev_arr - curr_arr)
-        
-        # 計算每個像素的均方差 (MSE)
-        mse_per_pixel = np.mean(squared_diff, axis=2)
-        
-        # 計算每個像素的均方根差 (RMSE)，即顏色距離
-        rmse_per_pixel = np.sqrt(mse_per_pixel)
-        average_rmse = float(np.mean(rmse_per_pixel))
-        
-        # 返回所有像素顏色距離的平均值和完整的差異矩陣
-        return average_rmse, rmse_per_pixel
+
+        rmse = calculate_rmse(prev_arr, curr_arr)
+
+        diff = cv2.absdiff(prev_arr, curr_arr)
+        if diff.ndim == 3:
+            coeff = np.array([[1/3, 1/3, 1/3]], dtype=np.float32)
+            channel_avg = cv2.transform(diff, coeff).squeeze(axis=2)
+            rmse_per_pixel = cv2.sqrt(channel_avg)
+        else:
+            rmse_per_pixel = diff
+
+        return rmse, rmse_per_pixel
         
     except Exception as e:
         print(f"計算 roi_diff 時出錯: {e}")
         return 0.0, None
 
 def calculate_average_binary_diff(img1: np.ndarray, img2: np.ndarray) -> float:
+    """
+    计算两个二值化图像的差异比例。
+    假设输入已经是二值化图像 (0/255, uint8)。
+    """
     if img1.shape != img2.shape:
         return 0.0
-    b1 = (img1 > 127).astype(np.uint8)
-    b2 = (img2 > 127).astype(np.uint8)
-    diff = np.logical_xor(b1, b2)
-    return float(np.mean(diff))
+    
+    # 优化：假设输入已经是二值化图像，直接进行 XOR
+    # 如果不确定输入是否为二值，调用者应负责 binarize
+    diff = cv2.bitwise_xor(img1, img2)
+    
+    # countNonZero 是 OpenCV 中最快的非零计数方法
+    different_pixels = cv2.countNonZero(diff)
+    
+    if diff.size == 0:
+        return 0.0
+        
+    return float(different_pixels / diff.size)
 
 SINGLE_DIGIT_BORDER = 40        # px 左右黑邊寬度門檻
 SINGLE_DIGIT_THRESH = 0.03      # 左或右 >3% 白點 ⇒ 不是單一數字
@@ -102,31 +133,18 @@ def trim_black_borders(binary_img: np.ndarray, max_border: int = 1) -> np.ndarra
     h, w = binary_img.shape
     
     # 找到有白色像素的邊界
-    white_pixels = binary_img > 127  # 白色像素的遮罩
-    
-    # 找到包含白色像素的行和列
-    rows_with_white = np.any(white_pixels, axis=1)  # 每一行是否有白色
-    cols_with_white = np.any(white_pixels, axis=0)  # 每一列是否有白色
-    
-    # 如果沒有白色像素，返回原圖
-    if not np.any(rows_with_white) or not np.any(cols_with_white):
+    white_mask = (binary_img > 127).astype(np.uint8)
+    nonzero = cv2.findNonZero(white_mask)
+    if nonzero is None:
         return binary_img
+
+    x, y, w, h = cv2.boundingRect(nonzero)
+    left = max(0, x - max_border)
+    top = max(0, y - max_border)
+    right = min(binary_img.shape[1], x + w + max_border)
+    bottom = min(binary_img.shape[0], y + h + max_border)
     
-    # 找到第一個和最後一個包含白色的行/列
-    top = np.argmax(rows_with_white)
-    bottom = len(rows_with_white) - 1 - np.argmax(rows_with_white[::-1])
-    left = np.argmax(cols_with_white)
-    right = len(cols_with_white) - 1 - np.argmax(cols_with_white[::-1])
-    
-    # 加上最多 max_border 像素的邊框，但不超出原圖範圍
-    top = max(0, top - max_border)
-    bottom = min(h - 1, bottom + max_border)
-    left = max(0, left - max_border)
-    right = min(w - 1, right + max_border)
-    
-    # 裁切圖像
-    trimmed = binary_img[top:bottom+1, left:right+1]
-    
+    trimmed = binary_img[top:bottom, left:right]
     return trimmed
 
 

@@ -103,15 +103,19 @@ def iterate_roi_binary_from_cache(
                 continue
     for frame_idx in sorted(available_frames):
         rois_data: Dict[str, Dict[str, np.ndarray]] = {}
+        bin_file = rdir / f"frame_{frame_idx}_binary.png"
+        if not bin_file.exists():
+            continue
+        try:
+            pil_img = Image.open(bin_file).convert("L")
+        except Exception:
+            continue
+
         for region_name, _ in rois:
             rdir = region_dirs[region_name]
             if not rdir.exists():
                 continue
-            bin_file = rdir / f"frame_{frame_idx}_binary.png"
-            if not bin_file.exists():
-                continue
             try:
-                pil_img = Image.open(bin_file).convert("L")
                 rois_data[region_name] = {"binary_np": np.array(pil_img)}
             except Exception:
                 continue

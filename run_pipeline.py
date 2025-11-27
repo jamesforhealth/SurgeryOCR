@@ -26,22 +26,69 @@ from surgery_analysis_process import OCRProcessor
 from tqdm import tqdm
 import numpy as np
 
-def run_pipeline(video_path: Path, base_output_dir: Path, force: bool = False):
+
+def _initialize_ocr_processor(
+    video_name: str,
+    roi_config_path: Path,
+    stage_activation_dict: Dict,
+    char_sets_dict: Dict,
+    diff_threshold: float = 0.01
+)  -> Tuple[OCRProcessor, Dict[str, Any]]:
     """
-    單次讀取 (Single-Pass) 分析管線：
-    1. 讀取影片
-    2. (非同步) 儲存 Frame Cache
-    3. (同步) 執行 Stage Pattern Analysis
-    4. (緩衝/觸發) Machine Type Detection
-    5. (即時/回溯) OCR & Change Detection
+    初始化 OCR Processor
+    回傳: (ocr_processor, roi_dict)
+    """
+    # 1. 載入 Config
+    roi_dict = load_roi_config(roi_config_path, video_name=video_name)
+    
+    try:
+        roi_header_dict = load_roi_header_config(roi_config_path, video_name=video_name)
+    except Exception:
+        roi_header_dict = {}
+
+    # 2. 初始化 Processor
+    ocr_processor = OCRProcessor(
+        stage_activation_dict,
+        roi_header_dict,
+        char_sets_dict,
+        diff_threshold=diff_threshold
+    )
+    return ocr_processor, roi_dict
+
+def _flush_buffer(
+    ocr_processor: OCRProcessor,
+    roi_dict: Dict[str, Tuple[int, int, int, int]],
+    frame_buffer: List[Tuple[int, np.ndarray, Dict]],
+    async_saver: AsyncImageSaver,
+    analysis_dir: Path,
+    mode: str,
+    force: bool
+) -> None:
+    """
+    回溯處理 Buffer 中的幀。
+    """
+    for buf_idx, buf_encoded_img, buf_stage in frame_buffer:
+        # 解碼 JPEG
+        buf_frame = cv2.imdecode(buf_encoded_img, cv2.IMREAD_COLOR)
+        if buf_frame is None: continue
+        
+        # 執行 OCR
+        ocr_processor.process_frame(buf_frame, buf_idx, roi_dict, buf_stage)
+        
+        # 非同步存 ROI 小圖 
+        if mode == "detail":
+            _save_roi_images(async_saver, buf_frame, roi_dict, buf_idx, analysis_dir, force)
+    print("⏩ 回溯完成，進入即時模式")
+    return 
+
+def run_pipeline(video_path: Path, base_output_dir: Path, mode: str = "detail", force: bool = False):
+    """
+    單次讀取 (Single-Pass) 分析管線
     """
     video_name = video_path.stem
     
-    # 建立輸出目錄結構： base_output_dir / video_name / ...
-    # 若使用者指定 base_output_dir (e.g. "data")，則輸出為 "data/video_name"
-    
+    # ... (省略部分路徑設定代碼) ...
     if base_output_dir.name == video_name:
-        # 使用者可能已經指定了完整路徑
         analysis_dir = base_output_dir
     else:
         analysis_dir = base_output_dir / video_name
@@ -72,49 +119,145 @@ def run_pipeline(video_path: Path, base_output_dir: Path, force: bool = False):
     region_matches: Dict[str, List[Tuple[int, Any, Any]]] = {
         region: [] for region in stage_analyzer.roi_dict.keys()
     }
-    machine_detector = MachineDetector() # 預設讀取 region1.png
+    machine_detector = MachineDetector()
     
-    # OCR Processor (初始時還不知道機型，ROI Config 稍後載入)
-    # 但可以先載入與機型無關的設定
+    # 載入 Configs
     stage_activation_dict = load_stage_config(stage_activation_path)
     char_sets_dict = load_ocr_char_sets_config(char_config_path)
     pattern_name_map = load_pattern_name_mapping(Path("config/pattern_name_mapping.json"))
     
-    # 由於 OCRProcessor 需要 roi_header_dict，這取決於機型，所以我們延後初始化或動態更新
-    # 這裡我們先建立一個暫存的結構，等機型確認後再實例化 Processor
+    # [優化] 預先檢查是否已有機型設定
+    # 若 rois.json 中已有該影片的 key，表示之前已跑過或已手動設定，直接使用該設定
+    pre_roi_dict = load_roi_config(roi_config_path)
+    # load_roi_config 會回傳整個 dict 或特定 video 的設定，我們這裡直接讀 raw json 比較準確
+    # 但為了方便，我們用一個簡單邏輯：嘗試 load_roi_config(..., video_name=video_name)
+    # 觀察其回傳是否為 default fallback。但因為 fallback 邏輯在 load_roi_config 內部，
+    # 最穩妥的方式是直接檢查 video_name 是否在 rois.json 的 keys 中
+    
+    # 機型偵測相關
+    machine_detected = False
+    machine_id = None
     ocr_processor: Optional[OCRProcessor] = None 
     roi_dict: Optional[Dict[str, Tuple[int, int, int, int]]] = None
+    
+    try:
+        with open(roi_config_path, 'r', encoding='utf-8') as f:
+            full_roi_config = json.load(f)
+            if video_name in full_roi_config.get('video_machine_mapping', {}):
+                # 直接讀取已知的 machine_id
+                machine_id = full_roi_config['video_machine_mapping'][video_name]
+                print(f"ℹ️  檢測到已知設定: {video_name} (Type {machine_id})，跳過機型偵測。")
+                machine_detected = True
+
+                ocr_processor, roi_dict = _initialize_ocr_processor(video_name, roi_config_path, stage_activation_dict, char_sets_dict)
+                
+    except Exception as e:
+        print(f"⚠️  讀取設定檔時發生警告: {e}")
     
     # --- 2. 狀態變數 ---
     t0 = time.time()
     processed_frames = 0
     
-    # 機型偵測相關
-    machine_detected = False
-    machine_id = None
-    pattern2_start_frame = None
-    
     # 緩衝區：儲存 (frame_idx, frame_bgr, stage_result)
     # 用於在機型確認前暫存畫面，以便回溯 OCR
     frame_buffer: List[Tuple[int, np.ndarray, Dict]] = []
     
-    # Frame Generator
-    frame_gen = video_frame_generator(video_path)
-    total_frames = getattr(frame_gen, "total_frames", None)
+    # Frame Source Setup
+    cap = None
+    cache_files = []
+    cache_iterator = None
+    total_frames = 0
+    
+    if mode == "read":
+        if not frame_cache_dir.exists():
+            print(f"❌ [Read Mode] Cache directory not found: {frame_cache_dir}")
+            return
+        
+        # 讀取所有 cache 檔案並按 frame index 排序
+        # 假設檔名格式為 frame_{idx}.jpg
+        try:
+            cache_files = sorted(
+                frame_cache_dir.glob("frame_*.jpg"), 
+                key=lambda p: int(p.stem.split('_')[1])
+            )
+        except Exception as e:
+             print(f"❌ [Read Mode] Error parsing cache files: {e}")
+             return
+
+        if not cache_files:
+            print(f"❌ [Read Mode] No cached frames found in: {frame_cache_dir}")
+            return
+            
+        total_frames = len(cache_files)
+        cache_iterator = iter(cache_files)
+        print(f"📂 [Read Mode] Found {total_frames} cached frames.")
+        
+    else:
+        # 改用直接控制 VideoCapture 以獲取時間戳並支援不同模式
+        cap = cv2.VideoCapture(str(video_path))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else None
+
+    frame_timestamps: List[float] = [] # 記錄每幀的時間戳 (ms)
     
     try:
-        for frame_idx, frame_bgr in tqdm(frame_gen, desc=f"Processing frames ({video_name})", total=total_frames):
-            processed_frames += 1
-            # if frame_idx % 100 == 0:
-            #     print(f"Processing frame {frame_idx}...", end='\r')
+        # 初始化 tqdm
+        pbar = tqdm(total=total_frames, desc=f"Processing frames ({video_name})")
+        
+        frame_idx = 0
+        while True:
+            frame_bgr = None
+            ts = 0.0
             
-            # [Step A] 非同步存大圖 (Frame Cache)
-            # 模擬 extract_frame_cache 的行為
-            cache_path = frame_cache_dir / f"frame_{frame_idx}.jpg"
-            if force or not cache_path.exists():
-                async_saver.save(frame_bgr, cache_path, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if mode == "read":
+                try:
+                    img_path = next(cache_iterator)
+                    # 從檔名解析 frame_idx
+                    frame_idx = int(img_path.stem.split('_')[1])
+                    
+                    # [Fix] Windows 下路徑含中文時，cv2.imread 會失敗，需改用 imdecode
+                    # frame_bgr = cv2.imread(str(img_path))
+                    img_array = np.fromfile(str(img_path), dtype=np.uint8)
+                    frame_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    
+                    if frame_bgr is None:
+                        print(f"⚠️ [Read Mode] Failed to read image: {img_path}")
+                        continue
+                    # Read mode 下時間戳暫時設為 0 或依賴外部記錄 (此處簡化)
+                    ts = 0.0 
+                except StopIteration:
+                    break
+            else:
+                if not cap.isOpened():
+                    break
+                    
+                # 獲取當前時間戳 (在 read 之前獲取 POS_MSEC)
+                ts = cap.get(cv2.CAP_PROP_POS_MSEC)
+                
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    break
+                
+                if frame_bgr is None or frame_bgr.size == 0:
+                    frame_idx += 1 # 即使是壞幀，索引也要遞增，保持時間軸一致
+                    continue
+
+            # 記錄時間戳
+            frame_timestamps.append(ts)
+            
+            processed_frames += 1
+            pbar.update(1)
+            
+            # [Step A] 根據 mode 決定是否存 Frame Cache (大圖)
+            # mode='detail' or 'frame' -> 存大圖
+            # mode='ram' -> 不存
+            # mode='read' -> 已經從 cache 讀了，不需要再存
+            if mode in ["detail", "frame"]:
+                cache_path = frame_cache_dir / f"frame_{frame_idx}.jpg"
+                if force or not cache_path.exists():
+                    async_saver.save(frame_bgr, cache_path, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             
             # [Step B] 階段分析 (Stage Analysis)
+
             # 這是通用的，不依賴機型
             stage_res = stage_analyzer.process_frame(frame_bgr, frame_idx)
             for region_name, res in stage_res.items():
@@ -128,77 +271,37 @@ def run_pipeline(video_path: Path, base_output_dir: Path, force: bool = False):
             
             # [Step C] 機型偵測與 OCR 分支邏輯
             if not machine_detected:
-                # 尚未確認機型：進入緩衝模式
-                frame_buffer.append((frame_idx, frame_bgr.copy(), stage_res))
+                # 1. 記憶體優化：將 Frame 壓縮為 JPEG Bytes 存入 Buffer
+                success, encoded_img = cv2.imencode('.jpg', frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if success:
+                    frame_buffer.append((frame_idx, encoded_img, stage_res))
                 
-                # 監測 Pattern 2
-                if current_stage_pattern == 2 and pattern2_start_frame is None:
-                    pattern2_start_frame = frame_idx
+                # 2. 逐幀偵測 (Frame-by-Frame Detection)
+                header_config = load_roi_header_config(video_name=None) # 預設機型1配置
                 
-                # 判斷是否觸發偵測 (Pattern 2 後 5 幀)
-                should_detect = (pattern2_start_frame is not None) and \
-                                (frame_idx == pattern2_start_frame + 5)
+                detected_id = None
+                if header_config and "region1" in header_config:
+                    detected_id = machine_detector.detect_from_frame(frame_bgr, header_config["region1"])
                 
-                # 防呆：若過了很久 (e.g. 500幀) 還沒 Pattern 2，強制使用預設機型
-                force_default = (frame_idx > 500 and pattern2_start_frame is None)
+                # 條件A: 成功偵測到機型
+                # 條件B: Buffer 超過安全上限 (例如 100000 幀)，強制使用預設機型
+                force_resolve = len(frame_buffer) > 100000
                 
-                if should_detect or force_default:
-                    print(f"\n🔍 觸發機型偵測 (Frame {frame_idx})...")
-                    
-                    # 嘗試偵測
-                    header_config = load_roi_header_config(video_name=None) # 預設機型1配置
-                    
-                    detected_id = None
-                    if should_detect and header_config and "region1" in header_config:
-                        detected_id = machine_detector.detect_from_frame(frame_bgr, header_config["region1"])
-                    
-                    machine_id = detected_id if detected_id else 2 # 預設為 2
-                    print(f"✅ 機型確認: Type {machine_id}")
-                    
+                if detected_id is not None or force_resolve:
+                    if detected_id:
+                        machine_id = detected_id
+                        update_video_machine_mapping(video_name, machine_id)
+                        print(f"\n✅ 偵測機型: Type {machine_id} (Frame {frame_idx})")
+                    else:
+                        machine_id = 1
+                        print(f"\n⚠️ 警告：Buffer 超過 100000 幀仍未偵測到機型，強制使用預設 Type 1")
+
+                    if 'pbar' in locals(): pbar.clear()
                     machine_detected = True
                     
-                    # --- 初始化 OCR Processor ---
-                    # 1. 載入對應機型的 ROI
-                    # 注意：load_roi_config 預設是讀檔，這裡我們需要根據機型 ID 直接載入
-                    # 但現有的 load_roi_config 是根據 video_name 去查 rois.json
-                    # 為了不修改 rois.json，我們這裡假設 rois.json 已經有 machine_1/machine_2 的模板
-                    # 或者我們直接根據 ID 選擇 "machine_1_default" / "machine_2_default"
-                    
-                    # 這裡使用一個小技巧：直接用 machine_id 來獲取對應的 Config
-                    # 假設 config/rois.json 中有 "machine_1_default" 和 "machine_2_default"
-                    # 或是使用 load_roi_config 的 behavior：如果 mapping 沒找到，會 fallback
-                    # 我們手動構建一個 mock video name 來騙過 load_roi_config，或者直接傳入 machine_id 邏輯
-                    
-                    # 為了保持乾淨，我們假設 rois.json 裡有定義：
-                    # "machine_1_default": { ... }, "machine_2_default": { ... }
-                    update_video_machine_mapping(video_name, machine_id)
-                    roi_dict = load_roi_config(roi_config_path, video_name=video_name)
-                    
-                    # 載入 Header Config (用於 OCR active check)
-                    try:
-                        roi_header_dict = load_roi_header_config(roi_config_path, video_name=video_name)
-                    except Exception:
-                        roi_header_dict = {}
-
-                    # 初始化 Processor
-                    ocr_processor = OCRProcessor(
-                        stage_activation_dict,
-                        roi_header_dict,
-                        char_sets_dict,
-                        diff_threshold=0.01
-                    )
-                    
-                    # --- 回溯處理緩衝區 (Flush Buffer) ---
-                    print(f"⏪ 回溯處理緩衝區 ({len(frame_buffer)} frames)...")
-                    for buf_idx, buf_frame, buf_stage in frame_buffer:
-                        # 執行 OCR
-                        ocr_processor.process_frame(buf_frame, buf_idx, roi_dict, buf_stage)
-                        
-                        # 非同步存 ROI 小圖 (如果需要)
-                        _save_roi_images(async_saver, buf_frame, roi_dict, buf_idx, analysis_dir, force)
-                        
-                    frame_buffer = [] # 清空
-                    print("⏩ 回溯完成，進入即時模式")
+                    ocr_processor, roi_dict = _initialize_ocr_processor(video_name, roi_config_path, stage_activation_dict, char_sets_dict)
+                    _flush_buffer(ocr_processor, roi_dict, frame_buffer, async_saver, analysis_dir, mode, force)
+                    frame_buffer = [] # 清空 Buffer
 
             else:
                 # 機型已確認：即時處理模式
@@ -207,7 +310,10 @@ def run_pipeline(video_path: Path, base_output_dir: Path, force: bool = False):
                     ocr_processor.process_frame(frame_bgr, frame_idx, roi_dict, stage_res)
                     
                     # 非同步存 ROI 小圖
-                    _save_roi_images(async_saver, frame_bgr, roi_dict, frame_idx, analysis_dir, force)
+                    if mode == "detail":
+                        _save_roi_images(async_saver, frame_bgr, roi_dict, frame_idx, analysis_dir, force)
+
+            frame_idx += 1 # 確保每一幀索引遞增
 
     except KeyboardInterrupt:
         print("\n⚠️ 使用者中斷")
@@ -306,6 +412,8 @@ def main() -> None:
     parser.add_argument("--video", type=Path, required=True, help="影片檔或包含影片的資料夾")
     parser.add_argument("--output-dir", type=Path, default=Path("data"), help="輸出根目錄")
     parser.add_argument("--force", action="store_true", help="覆蓋既有 frame cache 與 ROI 圖片")
+    parser.add_argument("--mode", type=str, default="ram", choices=["detail", "frame", "ram", "read"],
+                       help="存檔模式: detail (全存), frame (只存大圖), ram (不存圖), read (讀取快取)")
     args = parser.parse_args()
 
     target_path = args.video
@@ -324,10 +432,10 @@ def main() -> None:
 
     for idx, vf in enumerate(video_files, start=1):
         print(f"\n{'=' * 60}")
-        print(f"[{idx}/{len(video_files)}] 🎬 處理影片: {vf.name}")
+        print(f"[{idx}/{len(video_files)}] 🎬 處理影片: {vf.name} (Mode: {args.mode})")
         print(f"{'=' * 60}")
         try:
-            run_pipeline(vf, args.output_dir, args.force)
+            run_pipeline(vf, args.output_dir, args.mode, args.force)
         except Exception as e:
             print(f"❌ 處理 {vf.name} 時發生錯誤: {e}")
             traceback.print_exc()

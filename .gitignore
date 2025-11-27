@@ -56,3 +56,6 @@ models/frame_change_detector/
 build/
 dist/
 release_env/
+
+#debugging/ profiling files
+*.pstats

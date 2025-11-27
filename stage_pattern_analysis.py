@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,7 +17,7 @@ from PIL import Image
 from extract_frame_cache import iterate_frames, get_frame_cache_dir
 from utils.get_configs import load_diff_rules, load_pattern_name_mapping, read_surgery_stage_rois
 from utils.get_paths import resolve_video_analysis_dir
-
+from utils.cv_processing import calculate_rmse, calculate_ndarray_diff
 
 # -----------------------------
 # Data structures
@@ -52,52 +53,7 @@ def binarize_otsu(image_rgb: np.ndarray) -> np.ndarray:
     return binary
 
 
-def calculate_rmse(a: np.ndarray, b: np.ndarray) -> float:
-    if a.shape != b.shape:
-        # 在偵錯模式下提供更詳細的形狀不匹配資訊
-        print(f"    [DEBUG] 🔴 錯誤: 形狀不匹配! 圖像A: {a.shape}, 圖像B: {b.shape}")
-        return float("inf")
-    a_f = a.astype(np.float32)
-    b_f = b.astype(np.float32)
-    mse = np.mean((a_f - b_f) ** 2)
-    return float(np.sqrt(mse))
-
-
-def calculate_pedal_frame_diff(prev_img: np.ndarray, curr_img: np.ndarray, sub_roi_coords: List[int]) -> float:
-    """計算兩張 PEDAL ROI 圖像在指定精細區域內的平均RGB顏色差異 (與 UI 中的邏輯相同)"""
-    try:
-        x1, y1, x2, y2 = sub_roi_coords
-        
-        # 從兩張圖像中裁剪出精細區域
-        prev_sub_roi = prev_img[y1:y2, x1:x2]
-        curr_sub_roi = curr_img[y1:y2, x1:x2]
-        
-        # 檢查尺寸是否一致
-        if prev_sub_roi.shape != curr_sub_roi.shape:
-            return 0.0
-        
-        # 轉換為 float32
-        prev_arr = prev_sub_roi.astype(np.float32)
-        curr_arr = curr_sub_roi.astype(np.float32)
-        
-        # 計算每個像素RGB通道差值的平方
-        squared_diff = np.square(prev_arr - curr_arr)
-        
-        # 計算每個像素的均方差 (MSE)
-        mse_per_pixel = np.mean(squared_diff, axis=2)
-        
-        # 計算每個像素的均方根差 (RMSE)，即顏色距離
-        rmse_per_pixel = np.sqrt(mse_per_pixel)
-        average_rmse = float(np.mean(rmse_per_pixel))
-        
-        return average_rmse
-        
-    except Exception as e:
-        print(f"計算 PEDAL 前後幀差異時出錯: {e}")
-        return 0.0
-
-
-def load_region_patterns(cache_dir: Path, region_name: str) -> List[RegionPattern]:
+def _load_region_patterns(cache_dir: Path, region_name: str) -> List[RegionPattern]:
     region_dir = cache_dir / region_name
     if not region_dir.exists():
         return []
@@ -107,6 +63,7 @@ def load_region_patterns(cache_dir: Path, region_name: str) -> List[RegionPatter
             arr = np.load(npy_path)
             if not isinstance(arr, np.ndarray):
                 continue
+            arr = arr.astype(np.float32, copy=False)
             try:
                 pid = int(npy_path.stem)
             except ValueError:
@@ -117,7 +74,7 @@ def load_region_patterns(cache_dir: Path, region_name: str) -> List[RegionPatter
     return patterns
 
 
-def get_analysis_candidate(roi_rgb: np.ndarray, region_name: str, region_config: Dict, args: argparse.Namespace, frame_idx: int) -> np.ndarray:
+def _get_analysis_candidate(roi_input: np.ndarray, region_name: str, region_config: Dict, args: argparse.Namespace, frame_idx: int, input_is_bgr: bool = False) -> np.ndarray:
     """根據區域配置，從原始ROI中準備用於分析的圖像陣列"""
     analysis_mode = region_config.get("analysis_mode", "full_roi")
     is_pedal_debug = args.debug_pedal and region_name == "PEDAL"
@@ -126,25 +83,39 @@ def get_analysis_candidate(roi_rgb: np.ndarray, region_name: str, region_config:
         print(f"\n[PEDAL DEBUG] Frame {frame_idx} | 步驟 2: 準備分析圖像")
         print(f"    - 分析模式: {analysis_mode}")
 
-    if region_name == "PEDAL" and analysis_mode == "sub_roi":
-        sub_coords = region_config.get("sub_roi_coords", [20, 13, 26, 19])
-        x1, y1, x2, y2 = sub_coords
-        h, w = roi_rgb.shape[:2]
-        if x2 > w or y2 > h or x1 < 0 or y1 < 0:
-            print(f"    [PEDAL DEBUG] 🔴 警告: 精細區域座標 {sub_coords} 超出ROI範圍 {(w, h)}")
+    if region_name == "PEDAL":
+        # PEDAL 需要 RGB 格式
+        if input_is_bgr:
+            roi_rgb = cv2.cvtColor(roi_input, cv2.COLOR_BGR2RGB)
+        else:
+            roi_rgb = roi_input
+
+        if analysis_mode == "sub_roi":
+            sub_coords = region_config.get("sub_roi_coords", [20, 13, 26, 19])
+            x1, y1, x2, y2 = sub_coords
+            h, w = roi_rgb.shape[:2]
+            if x2 > w or y2 > h or x1 < 0 or y1 < 0:
+                print(f"    [PEDAL DEBUG] 🔴 警告: 精細區域座標 {sub_coords} 超出ROI範圍 {(w, h)}")
+                return roi_rgb
+            
+            cand_array = roi_rgb[y1:y2, x1:x2]
+            if is_pedal_debug:
+                print(f"    - 裁切後的候選圖像尺寸: {cand_array.shape}")
+            return cand_array
+        else:
             return roi_rgb
-        
-        cand_array = roi_rgb[y1:y2, x1:x2]
-        if is_pedal_debug:
-            print(f"    - 裁切後的候選圖像尺寸: {cand_array.shape}")
-        return cand_array
-    elif region_name == "PEDAL":
-        return roi_rgb
     else:
-        return binarize_otsu(roi_rgb)
+        # 其他區域使用 OTSU 二值化 (從 Gray)
+        if input_is_bgr:
+            gray = cv2.cvtColor(roi_input, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = cv2.cvtColor(roi_input, cv2.COLOR_RGB2GRAY)
+            
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        return binary
 
 
-def match_best_pattern(
+def _match_best_pattern(
     cand_array: np.ndarray,
     patterns: List[RegionPattern],
     rmse_threshold: float,
@@ -175,16 +146,22 @@ def match_best_pattern(
             print("    [PEDAL DEBUG] 🔴 錯誤: 沒有載入任何樣板，無法比對。")
         return None, None
     
+    cand_array = cand_array.astype(np.float32, copy=False)
     best_pid: Optional[int] = None
     best_rmse: float = float("inf")
+
+    # 優化：將循環不變量移出循環
+    use_sub_roi = (region_name == "PEDAL" and analysis_mode == "sub_roi")
+    sub_coords = region_config.get("sub_roi_coords") if use_sub_roi else None
+    x1, y1, x2, y2 = (0, 0, 0, 0)
+    if sub_coords:
+         x1, y1, x2, y2 = sub_coords
 
     for p in patterns:
         full_ref_array = p.array
         ref_for_comparison = full_ref_array
 
-        if region_name == "PEDAL" and analysis_mode == "sub_roi":
-            sub_coords = region_config.get("sub_roi_coords")
-            x1, y1, x2, y2 = sub_coords
+        if use_sub_roi:
             if full_ref_array.shape[1] > x2 and full_ref_array.shape[0] > y2:
                 ref_for_comparison = full_ref_array[y1:y2, x1:x2]
             else:
@@ -192,14 +169,23 @@ def match_best_pattern(
                     print(f"    [PEDAL DEBUG] 🔴 警告: 樣板 ID {p.pattern_id} (尺寸 {full_ref_array.shape}) 太小，無法使用 sub_roi 座標 {sub_coords} 進行裁切。")
                 continue
 
-        rmse = calculate_rmse(ref_for_comparison, cand_array)
-        
+        # 優化：內聯 RMSE 計算，減少函數調用開銷
+        if ref_for_comparison.shape != cand_array.shape:
+            if is_pedal_debug:
+                 print(f"    [DEBUG] 🔴 錯誤: 形狀不匹配! Pattern: {ref_for_comparison.shape}, Cand: {cand_array.shape}")
+            rmse = float("inf")
+        else:
+            rmse = calculate_rmse(ref_for_comparison, cand_array)
+
         if is_pedal_debug:
             print(f"    - 正在比對樣板 ID: {p.pattern_id} (比對尺寸: {ref_for_comparison.shape}) -> 計算出的 RMSE: {rmse:.4f}")
         
         if rmse < best_rmse:
             best_rmse = rmse
             best_pid = p.pattern_id
+            # 優化：如果已經完全匹配，就不需要再找了
+            if best_rmse == 0.0:
+                break
 
     is_match = best_pid is not None and best_rmse < rmse_threshold
     
@@ -311,8 +297,8 @@ def analyze_pedal_frame(
         if is_pedal_debug:
             print(f"    - 策略: 第一幀，直接進行 cache 比對")
         
-        cand_array = get_analysis_candidate(current_roi, "PEDAL", region_config, args, frame_idx)
-        pid, rmse = match_best_pattern(
+        cand_array = _get_analysis_candidate(current_roi, "PEDAL", region_config, args, frame_idx)
+        pid, rmse = _match_best_pattern(
             cand_array, patterns, cache_hit_threshold, args, frame_idx,
             region_name="PEDAL", region_config=region_config
         )
@@ -320,7 +306,7 @@ def analyze_pedal_frame(
         return pid, rmse
     
     # 後續幀：先計算前後幀差異
-    frame_diff = calculate_pedal_frame_diff(prev_roi, current_roi, sub_coords)
+    frame_diff = calculate_ndarray_diff(prev_roi, current_roi, sub_coords)
     
     if is_pedal_debug:
         print(f"    - 與前一幀的差異值: {frame_diff:.2f}")
@@ -339,8 +325,8 @@ def analyze_pedal_frame(
             print(f"    - 將使用 cache 匹配門檻: {cache_hit_threshold}")
             debug_pause(args, "即將開始 cache 比對")
         
-        cand_array = get_analysis_candidate(current_roi, "PEDAL", region_config, args, frame_idx)
-        pid, rmse = match_best_pattern(
+        cand_array = _get_analysis_candidate(current_roi, "PEDAL", region_config, args, frame_idx)
+        pid, rmse = _match_best_pattern(
             cand_array, patterns, cache_hit_threshold, args, frame_idx,
             region_name="PEDAL", region_config=region_config
         )
@@ -373,7 +359,7 @@ class StageAnalyzer:
         
         # 載入 Patterns
         self.region_to_patterns: Dict[str, List[RegionPattern]] = {
-            region: load_region_patterns(cache_dir, region) for region in self.roi_dict.keys()
+            region: _load_region_patterns(cache_dir, region) for region in self.roi_dict.keys()
         }
         
         # 狀態變數
@@ -394,10 +380,11 @@ class StageAnalyzer:
                 ...
             }
         """
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        # 優化：移除全幀 RGB 轉換，改為針對每個 ROI 處理
         results = {}
         
         # 使用 argparse.Namespace 來模擬原本 args 傳遞給輔助函數
+        # 為了效能，可以考慮將此對象緩存，但在此先保持簡單
         mock_args = argparse.Namespace(debug_pedal=self.debug, interactive=False)
 
         for region_name, coords in self.roi_dict.items():
@@ -406,7 +393,7 @@ class StageAnalyzer:
             threshold = rmse_threshold if rmse_threshold is not None else region_config.get("diff_threshold", 30.0)
 
             x1, y1, x2, y2 = map(int, coords)
-            h, w = frame_rgb.shape[:2]
+            h, w = frame_bgr.shape[:2]
             
             # 邊界檢查
             if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
@@ -415,11 +402,14 @@ class StageAnalyzer:
                 results[region_name] = {"pattern_id": None, "rmse": None}
                 continue
                 
-            roi_rgb = frame_rgb[y1:y2, x1:x2]
+            roi_bgr = frame_bgr[y1:y2, x1:x2]
             
             pid, rmse = None, None
             
             if region_name == "PEDAL":
+                # PEDAL 需要 RGB 進行分析
+                roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+                
                 # 注入狀態
                 analyze_pedal_frame.prev_match_result = self.pedal_prev_match
                 
@@ -431,13 +421,14 @@ class StageAnalyzer:
                 
                 # 保存狀態
                 self.pedal_prev_match = analyze_pedal_frame.prev_match_result
-                self.prev_frame_rois[region_name] = roi_rgb.copy()
+                self.prev_frame_rois[region_name] = roi_rgb.copy() # 這裡還是存 RGB 以供下一幀比較
                 
             else:
-                cand_array = get_analysis_candidate(roi_rgb, region_name, region_config, mock_args, frame_idx)
+                # 非 PEDAL 區域，傳入 BGR 並在 _get_analysis_candidate 內部轉 Gray -> Binary，省去 RGB 轉換
+                cand_array = _get_analysis_candidate(roi_bgr, region_name, region_config, mock_args, frame_idx, input_is_bgr=True)
                 patterns = self.region_to_patterns.get(region_name, [])
                 if patterns:
-                    pid, rmse = match_best_pattern(
+                    pid, rmse = _match_best_pattern(
                         cand_array, patterns, threshold, mock_args, frame_idx,
                         region_name=region_name, region_config=region_config
                     )

@@ -11,6 +11,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from functools import lru_cache
 from typing import List, Tuple, Dict, Any, Optional
 
 import cv2
@@ -66,15 +67,16 @@ class OCRProcessor:
         # Stats
         self.stats: Dict[str, Dict] = {}
 
-    def initialize_region(self, region_name: str):
-        """Ensure containers are ready for a specific region"""
-        if region_name not in self.prev_bins:
-            self.prev_bins[region_name] = None
-            self.prev_active_states[region_name] = None
-            self.cache_map[region_name] = []
-            self.multi_digit_groups[region_name] = []
-            self.single_digit_results[region_name] = []
-            self.stats[region_name] = {"ocr_time_total": 0.0, "ocr_count": 0, "change_count": 0}
+    def initialize_regions(self, roi_config: Dict[str, Any]):
+        """Ensure containers are ready for all regions at once"""
+        for region_name in roi_config:
+            if region_name not in self.prev_bins:
+                self.prev_bins[region_name] = None
+                self.prev_active_states[region_name] = None
+                self.cache_map[region_name] = []
+                self.multi_digit_groups[region_name] = []
+                self.single_digit_results[region_name] = []
+                self.stats[region_name] = {"ocr_time_total": 0.0, "ocr_count": 0, "change_count": 0}
 
     def process_frame(self, 
                       frame_bgr: np.ndarray, 
@@ -85,12 +87,11 @@ class OCRProcessor:
         Process a single frame: crop ROIs -> binarize -> diff check -> OCR.
         Returns new OCR results found in this frame.
         """
+        # 首次运行时初始化所有區域
+        if not self.prev_bins:
+            self.initialize_regions(roi_config)
+
         new_results = {} # { region_name: [result_dict, ...] }
-        
-        # Construct a virtual stage analysis dict for _active_in_stage
-        # We assume stage_result comes from StageAnalyzer.process_frame() which returns {region: {pattern_id, rmse}}
-        # But _active_in_stage expects the full JSON structure.
-        # For single-pass, we simplify: we only need current STAGE pattern.
         
         current_stage_pattern = -1
         if stage_result and "STAGE" in stage_result:
@@ -99,7 +100,7 @@ class OCRProcessor:
                 current_stage_pattern = -1
 
         for region_name, coords in roi_config.items():
-            self.initialize_region(region_name)
+            # Removed per-frame initialize_region call
             
             # 1. Active Check (Simplified for single-pass)
             is_active = self._check_active(region_name, frame_idx, current_stage_pattern, frame_bgr)
@@ -129,7 +130,7 @@ class OCRProcessor:
             try:
                 roi_bgr = frame_bgr[y1:y2, x1:x2]
                 if roi_bgr.size == 0: continue
-                curr_bin = binarize(roi_bgr, method="rule")
+                curr_bin = binarize(roi_bgr)
             except Exception:
                 continue
             
@@ -139,6 +140,7 @@ class OCRProcessor:
             if prev_bin is None:
                 change = True
             else:
+                # calculate_average_binary_diff 已經優化，不再重複做 threshold
                 diff = calculate_average_binary_diff(prev_bin, curr_bin)
                 change = diff >= self.diff_threshold
             
@@ -168,13 +170,14 @@ class OCRProcessor:
                             break
                 
                 if not from_cache:
-                    ocr_result, conf = self.ocr_iface.recognize(Image.fromarray(curr_bin), allowlist=custom_allowlist)
+                    # 優化：直接傳入 numpy array，省去 PIL 轉換
+                    ocr_result, conf = self.ocr_iface.recognize(curr_bin, allowlist=custom_allowlist)
                     ocr_calls += 1
                     
                     if not ocr_result:
                         trimmed = trim_black_borders(curr_bin, max_border=1)
                         if trimmed.size > 0 and trimmed.shape != curr_bin.shape:
-                             ocr_result, conf = self.ocr_iface.recognize(Image.fromarray(trimmed), allowlist=custom_allowlist)
+                             ocr_result, conf = self.ocr_iface.recognize(trimmed, allowlist=custom_allowlist)
                              ocr_calls += 1
                     
                     if is_multi_digit:
@@ -251,6 +254,23 @@ class OCRProcessor:
 # Original Utilities (Kept for backward compatibility)
 # --------------------------------------------------------------------------
 
+_HEADER_TEMPLATE_DIR = Path("data/roi_img_caches/roi_headers")
+
+@lru_cache(maxsize=None)
+def _load_header_template(region_name: str) -> Optional[np.ndarray]:
+    cache_path = _HEADER_TEMPLATE_DIR / f"{region_name}.png"
+    if not cache_path.exists():
+        return None
+    try:
+        template = cv2.imread(str(cache_path), cv2.IMREAD_GRAYSCALE)
+        if template is None:
+            return None
+        _, template = cv2.threshold(template, 127, 255, cv2.THRESH_BINARY)
+        return template
+    except Exception:
+        return None
+
+
 def _is_active_header(
     frame: np.ndarray,
     region_name: str,
@@ -261,65 +281,40 @@ def _is_active_header(
     """
     檢查指定region的header是否在當前frame中active（與快取圖像匹配）
     """
-    # if not roi_header_dict or region_name not in roi_header_dict:
-    #     return True
-    
-    # For backward compatibility, we need to handle cases where dict might not have the key
     if not roi_header_dict or region_name not in roi_header_dict:
-         return True
+        return True
 
     header_coords = roi_header_dict[region_name]
-    cache_path = Path("data/roi_img_caches/roi_headers") / f"{region_name}.png"
-
     if len(header_coords) != 4:
         return True
-    
-    # 載入快取的header圖像
-    if not cache_path.exists():
-        # print(f"警告: 找不到 {region_name} 的header快取圖像: {cache_path}")
-        return True  # 沒有快取時默認active
-    
-    try:
-        # 載入快取的二值化header圖像
-        cached_header_pil = Image.open(cache_path).convert('L')
-        cached_header = np.array(cached_header_pil)
-    except Exception as e:
-        # print(f"警告: 載入 {region_name} header快取失敗: {e}")
+
+    cached_header = _load_header_template(region_name)
+    if cached_header is None:
         return True
-    
+
     x1, y1, x2, y2 = header_coords
-    
-    # 確保座標在圖像範圍內
     h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
-    
     if x1 >= x2 or y1 >= y2:
-        return True  # 無效座標，默認active
-    
-    # 提取當前幀的header區域
+        return True
+
     try:
         header_roi_bgr = frame[y1:y2, x1:x2]
-        if header_roi_bgr.size == 0: return True
-    except:
+        if header_roi_bgr.size == 0:
+            return True
+    except Exception:
         return True
-    
-    # 應用與快取一致的二值化處理
+
     try:
-        current_header = binarize(header_roi_bgr, method="rule")
-    except Exception as e:
-        # print(f"警告: {region_name} header二值化失敗: {e}")
+        current_header = binarize(header_roi_bgr)
+    except Exception:
         return True
-    
-    # 檢查尺寸是否一致
+
     if cached_header.shape != current_header.shape:
-        # print(f"警告: {region_name} header尺寸不匹配")
         return True
-    
-    # 使用binary diff計算差異
+
     diff_ratio = calculate_average_binary_diff(cached_header, current_header)
-    
-    # 差異小於閾值表示header匹配（已active）
     return diff_ratio < diff_threshold
 
 def _active_in_stage(
@@ -417,7 +412,6 @@ def _determine_if_setting_value(
 def process_video(
     video_path: Path,
     rois: List[Tuple[str, Tuple[int, int, int, int]]],
-    method: str = "rule",
     diff_thresh: float = 0.01,
     save_dir: Path | None = None,
     stage_activation_dict: Dict[str, List[int]] | None = None,
@@ -475,7 +469,7 @@ def process_video(
     t0 = time.perf_counter()
 
     # 以 ROI 提供者 API 迭代，統一取得 rois_data
-    frame_provider = iterate_roi_binary_from_cache(video_path, rois, binarize_method=method)
+    frame_provider = iterate_roi_binary_from_cache(video_path, rois)
     meta = get_video_meta(video_path)
     total_hint = meta.get('total_frames', 0) or None
     pbar = tqdm(total=total_hint, desc=f"分析 {video_path.name}", unit="frame")
@@ -623,92 +617,6 @@ def process_video(
     print("="* (42 + len(video_path.name)))
 
 
-# ---------------------------------------------------------------------------
-# Testing API for UI integration
-# ---------------------------------------------------------------------------
-# ... (Keep test_current_frame_change as is) ...
-def test_current_frame_change(
-    frame_idx: int,
-    video_name: str,
-    region_name: str = "region2",
-    diff_threshold: float = 0.01,
-    binarize_method: str = "rule",  # 保留此參數以保持接口一致性，但不使用
-    roi_config_path: Path = Path("config/rois.json")
-) -> Dict[str, Any]:
-    """
-    測試指定frame是否會被算法判定為frame change。
-    直接讀取已經預處理好的二值化圖片進行測試。
-    """
-    try:
-        # 1. 驗證ROI配置（確保region_name有效）
-        roi_dict = load_roi_config(roi_config_path)
-        if region_name not in roi_dict:
-            return {'error': f'ROI配置中找不到區域 "{region_name}"'}
-        
-        # 2. 構建圖片目錄路徑
-        region_dir = Path("data") / video_name / region_name
-        if not region_dir.exists():
-            return {'error': f'找不到區域目錄: {region_dir}'}
-        
-        # 3. 檢查frame範圍
-        if frame_idx <= 0:
-            return {'error': '當前為第一幀或更早，無法與前一幀比較'}
-        
-        # 4. 構建圖片文件路徑
-        previous_frame_idx = frame_idx - 1
-        current_image_path = region_dir / f"frame_{frame_idx}_binary.png"
-        previous_image_path = region_dir / f"frame_{previous_frame_idx}_binary.png"
-        
-        # 5. 檢查圖片文件是否存在
-        if not previous_image_path.exists():
-            return {'error': f'找不到前一幀二值化圖片: {previous_image_path}'}
-        
-        if not current_image_path.exists():
-            return {'error': f'找不到當前幀二值化圖片: {current_image_path}'}
-        
-        # 6. 讀取二值化圖片
-        try:
-            prev_binary_pil = Image.open(previous_image_path).convert('L')  # 確保是灰階
-            curr_binary_pil = Image.open(current_image_path).convert('L')   # 確保是灰階
-            
-            prev_binary = np.array(prev_binary_pil)
-            curr_binary = np.array(curr_binary_pil)
-            
-        except Exception as e:
-            return {'error': f'讀取圖片失敗: {str(e)}'}
-        
-        # 7. 檢查圖片尺寸是否一致
-        if prev_binary.shape != curr_binary.shape:
-            return {'error': f'圖片尺寸不一致: 前一幀{prev_binary.shape} vs 當前幀{curr_binary.shape}'}
-        
-        # 8. 計算差異並判斷（使用與主流程完全相同的邏輯）
-        diff_ratio = calculate_average_binary_diff(prev_binary, curr_binary)
-        is_change = diff_ratio >= diff_threshold
-        
-        # 9. 生成結果
-        result = {
-            'is_change': is_change,
-            'diff_ratio': diff_ratio,
-            'threshold': diff_threshold,
-            'current_frame': frame_idx,
-            'previous_frame': previous_frame_idx,
-            'method': 'direct_read_binary',  # 表明是直接讀取二值化圖片
-            'current_image_path': str(current_image_path),
-            'previous_image_path': str(previous_image_path),
-            'region_dir': str(region_dir)
-        }
-        
-        if is_change:
-            result['reason'] = f'檢測到變化：差異比例 {diff_ratio:.4f} ≥ 閾值 {diff_threshold:.4f}'
-        else:
-            result['reason'] = f'未檢測到變化：差異比例 {diff_ratio:.4f} < 閾值 {diff_threshold:.4f}'
-        
-        return result
-        
-    except Exception as e:
-        return {'error': f'測試過程出錯: {str(e)}'}
-
-
 def parse_args() -> argparse.Namespace:  # pragma: no cover
     p = argparse.ArgumentParser(description="Binarised ROI frame‑change detection + OCR")
     p.add_argument("--video", required=True, type=Path, help="Path to video file or video files directory (e.g. mp4)")
@@ -716,7 +624,6 @@ def parse_args() -> argparse.Namespace:  # pragma: no cover
     p.add_argument("--roi-config", type=Path, default=Path("config/rois.json"), help="ROI config JSON path")
     p.add_argument("--stage-config", type=Path, default=Path("config/ocr_activation_stages.json"), help="Stage config JSON path")
     p.add_argument("--char-config", type=Path, default=Path("config/ocr_char_sets.json"), help="OCR character sets JSON path")
-    p.add_argument("--method", choices=["otsu", "rule"], default="rule", help="Binarisation method")
     p.add_argument("--diff-thresh", type=float, default=0.01, help="Diff ratio threshold (0‑1) to flag change")
     p.add_argument("--save-dir", type=Path, help="Directory to save jsonl (defaults to video directory)")
     p.add_argument("--force", action="store_true", help="強制重新分析，忽略已存在的結果檔案")
@@ -759,7 +666,7 @@ def main():  # pragma: no cover
                     rois = [(args.region, tuple(roi_dict[args.region]))]
             
             process_video(
-                video_file, rois, args.method, args.diff_thresh, args.save_dir, 
+                video_file, rois, args.diff_thresh, args.save_dir, 
                 stage_activation_dict, roi_header_dict, char_sets_dict, args.force
             )
 
@@ -781,7 +688,7 @@ def main():  # pragma: no cover
                 rois = [(args.region, tuple(roi_dict[args.region]))]
         
         process_video(
-            args.video, rois, args.method, args.diff_thresh, args.save_dir, 
+            args.video, rois, args.diff_thresh, args.save_dir, 
             stage_activation_dict, roi_header_dict, char_sets_dict, args.force
         )
 

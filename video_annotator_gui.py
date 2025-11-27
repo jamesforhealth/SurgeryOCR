@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import sys
+import time
 
 def is_release_mode():
     """
@@ -93,6 +94,7 @@ class VideoAnnotator(tk.Frame):
         self.fps = 30
         self.current_frame_idx = 0
         self.playback_active = False
+        self._play_loop_id = None
         
         # 資料模型
         self.annotations = {}
@@ -217,13 +219,11 @@ class VideoAnnotator(tk.Frame):
         master.bind("<Right>", self._on_right_key)
         master.bind("<Up>", self._on_up_key)
         master.bind("<Down>", self._on_down_key)
-        if IS_RELEASE:
-            pass
-        else:    
-            master.bind("<space>", self._toggle_ocr_test_window)
+        master.bind("<space>", self._toggle_playback)
 
     def _on_left_key(self, event=None):
         """處理左鍵事件 - 前一幀"""
+        self._stop_playback()
         print("左鍵按下 - 前一幀")
         self._is_arrow_key_navigation = True
         self._step_frame(-1)
@@ -231,6 +231,7 @@ class VideoAnnotator(tk.Frame):
 
     def _on_right_key(self, event=None):
         """處理右鍵事件 - 後一幀"""
+        self._stop_playback()
         print("右鍵按下 - 後一幀")
         self._is_arrow_key_navigation = True
         self._step_frame(+1)
@@ -238,6 +239,7 @@ class VideoAnnotator(tk.Frame):
 
     def _on_up_key(self, event=None):
         """處理上鍵事件 - 在TreeView中選擇上一項並跳轉"""
+        self._stop_playback()
         print("上鍵按下 - TreeView上一項")
         
         # 如果TreeView沒有內容，顯示提示
@@ -280,6 +282,7 @@ class VideoAnnotator(tk.Frame):
 
     def _on_down_key(self, event=None):
         """處理下鍵事件 - 在TreeView中選擇下一項並跳轉"""
+        self._stop_playback()
         print("下鍵按下 - TreeView下一項")
         
         # 如果TreeView沒有內容，顯示提示
@@ -322,6 +325,7 @@ class VideoAnnotator(tk.Frame):
 
     def _jump_to_selected_frame(self):
         """跳轉到TreeView中選中項目對應的幀"""
+        self._stop_playback()
         selected_items = self.tree.selection()
         if not selected_items:
             return
@@ -346,9 +350,7 @@ class VideoAnnotator(tk.Frame):
         """創建 GUI 界面元素"""
         
         # 初始化變數（需要在UI創建前）
-        self.binarize_mode_var = tk.BooleanVar(value=False)
-        self.binarize_method_var = tk.StringVar(value="rule")
-        
+        self.binarize_mode_var = tk.BooleanVar(value=False)        
         # ========================= HEADER 區域 =========================
         header_frame = tk.Frame(self, relief="groove", bd=2)
         header_frame.pack(fill="x", padx=5, pady=5)
@@ -570,6 +572,9 @@ class VideoAnnotator(tk.Frame):
         self.goto_entry.bind("<Return>", self._on_goto_frame)
         tk.Button(nav_frame, text="Go", command=self._on_goto_frame).pack(side="left", padx=3)
         
+        self.btn_play = tk.Button(nav_frame, text="▶ 播放", command=self._toggle_playback, width=8)
+        self.btn_play.pack(side="left", padx=10)
+        
         # Create the frame counter label directly in its final parent container
         self.lbl_frame_num = tk.Label(self.slider_label_placeholder, text="幀: 0 / 0", font=("Arial", 9))
         self.lbl_frame_num.pack(expand=True, fill="both")
@@ -699,7 +704,7 @@ class VideoAnnotator(tk.Frame):
             
             # 第三行：空白鍵說明
             canvas.create_text(30, desc_y_start + line_height * 2, text="空白", fill=text_color, font=("Arial", 10, "bold"), anchor="w")
-            canvas.create_text(65, desc_y_start + line_height * 2, text="OCR測試視窗", fill=desc_color, font=("Arial", 9), anchor="w")
+            canvas.create_text(65, desc_y_start + line_height * 2, text="播放/暫停", fill=desc_color, font=("Arial", 9), anchor="w")
             
             # 添加分隔線美化
             canvas.create_line(20, desc_y_start - 8, 220, desc_y_start - 8, fill="#555555", width=1)
@@ -832,20 +837,12 @@ class VideoAnnotator(tk.Frame):
                 
             # 處理方法選擇
             tk.Label(btn_processing_frame, text="方法:", font=("Arial", 9)).pack(side="left", padx=(10, 2))
-            self.binarize_method = tk.StringVar(value="rule")
             method_frame = tk.Frame(btn_processing_frame)
             method_frame.pack(side="left", padx=(0, 10))
             
-            tk.Radiobutton(method_frame, text="OTSU", variable=self.binarize_method, 
-                          value="otsu", font=("Arial", 8)).pack(side="left")
-            # tk.Radiobutton(method_frame, text="K-means", variable=self.binarize_method, 
-            #               value="kmeans", font=("Arial", 8)).pack(side="left", padx=(5, 0))
-            tk.Radiobutton(method_frame, text="規則分割", variable=self.binarize_method, 
-                          value="rule", font=("Arial", 8)).pack(side="left", padx=(5, 0))
-            
             # 狀態指示
             self.processing_status_label = tk.Label(btn_processing_frame, 
-                                                   text="原始影像" if not self.is_processed_mode else f"二值化 ({self.binarize_method.get().upper()})",
+                                                   text="原始影像" if not self.is_processed_mode else "二值化",
                                                    font=("Arial", 9), 
                                                    fg="blue" if not self.is_processed_mode else "red")
             self.processing_status_label.pack(side="right", padx=(10, 0))
@@ -983,8 +980,7 @@ class VideoAnnotator(tk.Frame):
                 self.processing_status_label.config(text="原始影像", fg="blue")
             else:
                 # 切換到處理模式
-                method = self.binarize_method.get()
-                bin_np = self._apply_core_binarization(self.roi_image_original, method)
+                bin_np = self._apply_core_binarization(self.roi_image_original)
                 self.roi_image_processed = Image.fromarray(bin_np) if bin_np is not None else None
                 
                 if self.roi_image_processed is not None:
@@ -1184,7 +1180,6 @@ class VideoAnnotator(tk.Frame):
             # 處理狀態指示
             status_text = "處理後" if self.is_processed_mode else "原始"
             status_color = "red" if self.is_processed_mode else "blue"
-            method_info = f" ({self.binarize_method.get().upper()})" if self.is_processed_mode else ""
             
             tk.Label(text_frame, text=f"OCR結果 ({status_text}{method_info}):", 
                     font=("Arial", 10, "bold"), fg=status_color).pack(anchor="w")
@@ -1435,6 +1430,7 @@ class VideoAnnotator(tk.Frame):
 
     def _on_sub_roi_start(self, event):
         """開始選擇子區域"""
+        self._stop_playback()
         if len(self.sub_regions) >= 3:
             messagebox.showinfo("提示", "最多只能選擇3個子區域")
             return
@@ -1731,6 +1727,7 @@ class VideoAnnotator(tk.Frame):
 
     def _load_video(self):
         """載入影片檔案"""
+        self._stop_playback()
         filepath = filedialog.askopenfilename(
             title="選擇影片檔案",
             filetypes=[("影片檔案", "*.mp4 *.avi *.mov *.mkv"), ("所有檔案", "*.*")]
@@ -1796,6 +1793,62 @@ class VideoAnnotator(tk.Frame):
             print(f"載入影片失敗: {e}")
             traceback.print_exc()
             self.video_file_path = None 
+
+    def _toggle_playback(self, event=None):
+        """切換播放/暫停狀態"""
+        if not self.video_file_path:
+            return
+
+        if self.playback_active:
+            self._stop_playback()
+        else:
+            self.playback_active = True
+            if hasattr(self, 'btn_play'):
+                self.btn_play.config(text="⏸ 暫停")
+            
+            # 初始化播放計時
+            self._next_target_time = time.time()
+            self._play_video_loop()
+
+    def _stop_playback(self):
+        """停止播放"""
+        self.playback_active = False
+        if self._play_loop_id:
+            self.after_cancel(self._play_loop_id)
+            self._play_loop_id = None
+        if hasattr(self, 'btn_play'):
+            self.btn_play.config(text="▶ 播放")
+
+    def _play_video_loop(self):
+        """播放循環"""
+        if not self.playback_active:
+            return
+
+        # 如果已經到最後一幀，停止播放
+        if self.current_frame_idx >= self.total_frames - 1:
+            self._stop_playback()
+            return
+
+        # 前進一幀
+        next_frame = self.current_frame_idx + 1
+        self._show_frame(next_frame)
+
+        # 計算下一幀的目標時間
+        # 使用累積誤差補償：下一幀的目標時間 = 上一幀目標時間 + 幀間隔
+        target_interval = 1.0 / self.fps if self.fps > 0 else 0.033
+        
+        now = time.time()
+        # 如果落後太多 (> 500ms) 或者第一次執行，重置目標時間
+        if self._next_target_time < now - 0.5:
+            self._next_target_time = now
+            
+        self._next_target_time += target_interval
+        
+        # 計算剩餘等待時間 (秒 -> 毫秒)
+        wait_seconds = self._next_target_time - time.time()
+        delay = max(1, int(wait_seconds * 1000))
+        
+        self._play_loop_id = self.after(delay, self._play_video_loop)
 
     def _load_roi_from_file(self, frame_idx: int) -> Optional[Image.Image]:
         """從檔案載入 ROI 圖像"""
@@ -1890,8 +1943,7 @@ class VideoAnnotator(tk.Frame):
                 self.lbl_video.config(image=None)
                 return
             
-            bin_method = self.binarize_method_var.get()
-            bin_np = self._apply_core_binarization(roi_img, bin_method)
+            bin_np = self._apply_core_binarization(roi_img)
             bin_img = Image.fromarray(bin_np) if bin_np is not None else None
             if bin_img is None:
                 print(f"二值化失敗，顯示原始 ROI")
@@ -2121,8 +2173,8 @@ class VideoAnnotator(tk.Frame):
     def _calculate_general_roi_diff(self, prev_img: Image.Image, curr_img: Image.Image) -> float:
         """計算兩張ROI圖像的二值化像素差異比例（委派至 utils.cv_processing）。"""
         try:
-            prev_bin = self._apply_core_binarization(prev_img, "rule")
-            curr_bin = self._apply_core_binarization(curr_img, "rule")
+            prev_bin = self._apply_core_binarization(prev_img)
+            curr_bin = self._apply_core_binarization(curr_img)
             if prev_bin is None or curr_bin is None:
                 return 0.0
             prev_arr = prev_bin if isinstance(prev_bin, np.ndarray) else np.array(prev_bin)
@@ -2132,10 +2184,10 @@ class VideoAnnotator(tk.Frame):
             print(f"計算通用ROI diff時發生錯誤: {e}")
             return 0.0
 
-    def _apply_core_binarization(self, image: Image.Image, method: str) -> Optional[np.ndarray]:
+    def _apply_core_binarization(self, image: Image.Image) -> Optional[np.ndarray]:
         """應用與cv_processing.py完全一致的二值化處理"""
         try:
-            binary = binarize_pil(image, method)
+            binary = binarize_pil(image)
             return binary
                 
         except Exception as e:
@@ -2170,6 +2222,7 @@ class VideoAnnotator(tk.Frame):
     
     def _on_roi_start(self, event):
         """Records the starting coordinates for ROI selection."""
+        self._stop_playback()
         if self.surgery_stage_mode:
             self._on_surgery_stage_roi_start(event)
         else:
@@ -2393,6 +2446,7 @@ class VideoAnnotator(tk.Frame):
         使用者放開滑鼠按鍵 (或完成鍵盤調整) 後呼叫。
         此時才真正載入並顯示指定幀，並推送到背景偵測/ OCR 佇列。
         """
+        self._stop_playback()
         if self.total_frames == 0:
             return
         idx = int(float(self.slider_var.get()))
@@ -3172,6 +3226,7 @@ class VideoAnnotator(tk.Frame):
             print(f"滾動表格失敗: {e}")
 
     def _on_goto_frame(self, event=None):
+        self._stop_playback()
         try:
             idx = int(self.goto_var.get())
         except (ValueError, TypeError):
@@ -3186,6 +3241,7 @@ class VideoAnnotator(tk.Frame):
 
     def _clear_previous_video_data(self):
         """清除所有與當前影片相關的數據和UI狀態"""
+        self._stop_playback()
         self.playback_active = False
         if hasattr(self, 'after_id') and self.after_id:
             self.master.after_cancel(self.after_id)
@@ -4828,6 +4884,7 @@ class VideoAnnotator(tk.Frame):
 
     def _on_track_click(self, event, region_name: str):
         """處理軌道點擊事件"""
+        self._stop_playback()
         try:
             if region_name not in self.timeline_tracks:
                 return
@@ -5167,7 +5224,7 @@ class VideoAnnotator(tk.Frame):
                 processed_image = roi_image
             else:
                 # 其他區域進行二值化處理
-                bin_np = self._apply_core_binarization(roi_image, "otsu")
+                bin_np = self._apply_core_binarization(roi_image)
                 processed_image = Image.fromarray(bin_np) if bin_np is not None else None
                 if processed_image is None:
                     messagebox.showerror("錯誤", "二值化處理失敗")
@@ -5386,7 +5443,7 @@ class VideoAnnotator(tk.Frame):
                 current_array = np.array(current_roi_image)
             else:
                 # 其他區域進行二值化處理
-                bin_np = self._apply_core_binarization(current_roi_image, "otsu")
+                bin_np = self._apply_core_binarization(current_roi_image)
                 processed_image = Image.fromarray(bin_np) if bin_np is not None else None
                 if processed_image is None:
                     return False, float('inf')
@@ -5468,7 +5525,7 @@ class VideoAnnotator(tk.Frame):
             if region_name == "PEDAL":
                 current_array = np.array(current_roi)
             else:
-                bin_np = self._apply_core_binarization(current_roi, "otsu")
+                bin_np = self._apply_core_binarization(current_roi)
                 processed_image = Image.fromarray(bin_np) if bin_np is not None else None
                 if processed_image is None:
                     print(f"\n[Cache Diff] 無法處理當前ROI圖像")

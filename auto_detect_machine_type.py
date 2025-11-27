@@ -6,6 +6,7 @@
 import argparse
 import json
 import traceback
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 import cv2
@@ -23,6 +24,22 @@ from utils.get_paths import resolve_video_analysis_dir
 # --------------------------------------------------------------------------
 # [NEW] MachineDetector Class for Pipeline Integration
 # --------------------------------------------------------------------------
+@lru_cache(maxsize=None)
+def _load_reference_header_image_cached(ref_path: str) -> Optional[np.ndarray]:
+    path = Path(ref_path)
+    if not path.exists():
+        return None
+    try:
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+        _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+        return img
+    except Exception as e:
+        print(f"[MachineDetector] Error loading ref image: {e}")
+        return None
+
+
 class MachineDetector:
     """
     用於單次讀取 (Single-Pass) 流程的機型偵測器。
@@ -31,23 +48,9 @@ class MachineDetector:
     def __init__(self, ref_image_path: Path = Path("data/roi_img_caches/roi_headers/region1.png"), threshold: float = 0.03):
         self.ref_image_path = ref_image_path
         self.threshold = threshold
-        self.ref_binary = self._load_reference_header_image(ref_image_path)
+        self.ref_binary = _load_reference_header_image_cached(str(ref_image_path))
         if self.ref_binary is None:
             print(f"[MachineDetector] ⚠️ Warning: 無法載入參考圖: {ref_image_path}")
-
-    def _load_reference_header_image(self, ref_path: Path) -> Optional[np.ndarray]:
-        if not ref_path.exists():
-            return None
-        try:
-            img = Image.open(ref_path)
-            img_array = np.array(img)
-            if len(img_array.shape) == 3:
-                img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-            _, img_array = cv2.threshold(img_array, 127, 255, cv2.THRESH_BINARY)
-            return img_array
-        except Exception as e:
-            print(f"[MachineDetector] Error loading ref image: {e}")
-            return None
 
     def detect_from_frame(self, frame_bgr: np.ndarray, region1_coords: List[int]) -> Optional[int]:
         """
