@@ -94,14 +94,19 @@ def run_pipeline(video_path: Path, base_output_dir: Path, mode: str = "detail", 
         analysis_dir = base_output_dir / video_name
         
     analysis_dir.mkdir(parents=True, exist_ok=True)
-    frame_cache_dir = analysis_dir / "frame_cache"
-    frame_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"🚀 開始串流分析: {video_name}")
+    # RAM mode 不需要 frame_cache 目錄
+    frame_cache_dir = None
+    if mode in ["detail", "frame"]:
+        frame_cache_dir = analysis_dir / "frame_cache"
+        frame_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"🚀 開始串流分析: {video_name} (Mode: {mode})")
     print(f"📂 輸出目錄: {analysis_dir}")
 
     # --- 1. 初始化各個組件 ---
-    async_saver = AsyncImageSaver()
+    # RAM mode 不需要 AsyncImageSaver
+    async_saver = AsyncImageSaver() if mode in ["detail", "frame"] else None
     
     # Configs
     stage_config_path = Path("config/surgery_stage_rois.json")
@@ -329,9 +334,10 @@ def run_pipeline(video_path: Path, base_output_dir: Path, mode: str = "detail", 
     stage_total = total_frames if total_frames is not None else processed_frames
     _write_stage_analysis(video_name, analysis_dir, region_matches, stage_total, pattern_name_map)
         
-    # 等待 IO
-    print("⏳ 等待背景儲存完成...")
-    async_saver.stop()
+    # 等待 IO (只有在有 async_saver 時才需要)
+    if async_saver:
+        print("⏳ 等待背景儲存完成...")
+        async_saver.stop()
     print(f"\n✅ 分析完成，總耗時: {time.time() - t0:.2f}s (Frames: {processed_frames})")
 
 
@@ -413,7 +419,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("data"), help="輸出根目錄")
     parser.add_argument("--force", action="store_true", help="覆蓋既有 frame cache 與 ROI 圖片")
     parser.add_argument("--mode", type=str, default="ram", choices=["detail", "frame", "ram", "read"],
-                       help="存檔模式: detail (全存), frame (只存大圖), ram (不存圖), read (讀取快取)")
+                       help="存檔模式: detail (存大圖+ROI), frame (只存大圖), ram (不存圖, 最快), read (讀取快取)")
     args = parser.parse_args()
 
     target_path = args.video

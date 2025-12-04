@@ -140,7 +140,6 @@ class OCRProcessor:
             if prev_bin is None:
                 change = True
             else:
-                # calculate_average_binary_diff 已經優化，不再重複做 threshold
                 diff = calculate_average_binary_diff(prev_bin, curr_bin)
                 change = diff >= self.diff_threshold
             

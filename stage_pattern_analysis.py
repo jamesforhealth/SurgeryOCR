@@ -369,6 +369,17 @@ class StageAnalyzer:
         # 我們需要維護 analyze_pedal_frame 的內部狀態 (prev_match_result)
         # 為了避免多個實例互相干擾，我們將狀態存在 instance 中
         self.pedal_prev_match = (None, None) # (pid, rmse)
+        
+        # [優化] 預先創建 mock_args 對象，避免每幀都創建新對象
+        self._mock_args = argparse.Namespace(debug_pedal=debug, interactive=False)
+        
+        # [優化] 預先計算每個區域的配置和閾值
+        self._region_configs: Dict[str, Dict] = {}
+        self._region_thresholds: Dict[str, float] = {}
+        for region_name in self.roi_dict.keys():
+            config = self.diff_rules.get(region_name, {})
+            self._region_configs[region_name] = config
+            self._region_thresholds[region_name] = config.get("diff_threshold", 30.0)
     
     def process_frame(self, frame_bgr: np.ndarray, frame_idx: int, rmse_threshold: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
         """
@@ -380,17 +391,12 @@ class StageAnalyzer:
                 ...
             }
         """
-        # 優化：移除全幀 RGB 轉換，改為針對每個 ROI 處理
         results = {}
-        
-        # 使用 argparse.Namespace 來模擬原本 args 傳遞給輔助函數
-        # 為了效能，可以考慮將此對象緩存，但在此先保持簡單
-        mock_args = argparse.Namespace(debug_pedal=self.debug, interactive=False)
 
         for region_name, coords in self.roi_dict.items():
-            region_config = self.diff_rules.get(region_name, {})
-            # 優先使用傳入的 global threshold，否則使用 config 中的設定
-            threshold = rmse_threshold if rmse_threshold is not None else region_config.get("diff_threshold", 30.0)
+            # [優化] 使用預先緩存的配置和閾值
+            region_config = self._region_configs[region_name]
+            threshold = rmse_threshold if rmse_threshold is not None else self._region_thresholds[region_name]
 
             x1, y1, x2, y2 = map(int, coords)
             h, w = frame_bgr.shape[:2]
@@ -416,7 +422,7 @@ class StageAnalyzer:
                 pid, rmse = analyze_pedal_frame(
                     roi_rgb, self.prev_frame_rois[region_name],
                     self.region_to_patterns.get(region_name, []),
-                    region_config, mock_args, frame_idx
+                    region_config, self._mock_args, frame_idx
                 )
                 
                 # 保存狀態
@@ -425,11 +431,11 @@ class StageAnalyzer:
                 
             else:
                 # 非 PEDAL 區域，傳入 BGR 並在 _get_analysis_candidate 內部轉 Gray -> Binary，省去 RGB 轉換
-                cand_array = _get_analysis_candidate(roi_bgr, region_name, region_config, mock_args, frame_idx, input_is_bgr=True)
+                cand_array = _get_analysis_candidate(roi_bgr, region_name, region_config, self._mock_args, frame_idx, input_is_bgr=True)
                 patterns = self.region_to_patterns.get(region_name, [])
                 if patterns:
                     pid, rmse = _match_best_pattern(
-                        cand_array, patterns, threshold, mock_args, frame_idx,
+                        cand_array, patterns, threshold, self._mock_args, frame_idx,
                         region_name=region_name, region_config=region_config
                     )
             
