@@ -81,7 +81,6 @@ except ImportError:
 def iterate_roi_binary_from_cache(
     video_path: Path,
     rois: List[Tuple[str, Tuple[int, int, int, int]]],
-    binarize_method: str = "rule",
 ):
     """讀取已切好的 ROI 二值圖，逐幀輸出，不做任何影像處理。
 
@@ -129,7 +128,6 @@ def process_video(
     output_dir: Path | None = None,
     force: bool = False,
     save_binary: bool = True,
-    binarize_method: str = "rule",
     mode: str = "png",
 ) -> None:
     """处理单个视频文件"""
@@ -231,7 +229,7 @@ def process_video(
 
             # 二值圖
             if save_binary and (force or not out_bin.exists()):
-                binary = binarize(roi_bgr, method=binarize_method)
+                binary = binarize(roi_bgr)
                 try:
                     Image.fromarray(binary).save(out_bin)
                     saves_count += 1
@@ -370,7 +368,6 @@ def main():
             output_dir=args.output_dir,
             force=args.force,
             save_binary=args.save_binary,
-            binarize_method=args.method,
             mode=args.mode,
         )
         
@@ -419,7 +416,6 @@ def main():
                     output_dir=args.output_dir,
                     force=args.force,
                     save_binary=args.save_binary,
-                    binarize_method=args.method,
                     mode=args.mode,
                 )
             except Exception as e:

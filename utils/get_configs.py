@@ -353,3 +353,109 @@ def get_video_machine_id(video_name: str, path: Path = Path("config/rois.json"))
 def read_surgery_stage_rois(path: Path) -> Dict[str, List[int]]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def get_roi_config_path() -> Path:
+    """回傳 config/rois.json 路徑"""
+    return Path("config") / "rois.json"
+
+
+def save_roi_config(
+    roi_dict: Dict[str, List[int]],
+    roi_header_dict: Optional[Dict[str, List[int]]] = None,
+    video_name: Optional[str] = None,
+    machine_id: Optional[int] = None,
+    path: Path = None
+) -> bool:
+    """
+    儲存 ROI 設定到檔案，保留原有的 video_machine_mapping 和其他機型設定
+    
+    Args:
+        roi_dict: ROI 座標字典 {region_name: [x1, y1, x2, y2]}
+        roi_header_dict: ROI Header 座標字典 {region_name: [x1, y1, x2, y2]}（可選）
+        video_name: 視頻名稱（用於更新該視頻的機型映射）
+        machine_id: 機型編號（如果提供 video_name 則必須）
+        path: ROI 配置文件路徑（默認: config/rois.json）
+    
+    Returns:
+        bool: 儲存成功返回 True，失敗返回 False
+    """
+    if path is None:
+        path = get_roi_config_path()
+    
+    try:
+        # 讀取現有配置
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            # 如果檔案不存在，創建基本結構
+            data = {
+                "_comment": "整合的ROI配置文件，包含视频-机型映射和各机型的ROI座标",
+                "video_machine_mapping": {
+                    "_comment": "视频名称(不含扩展名)到机型编号的映射，1=机型A，2=机型B"
+                },
+                "regions": {}
+            }
+        
+        # 確保基本結構存在
+        if "video_machine_mapping" not in data:
+            data["video_machine_mapping"] = {
+                "_comment": "视频名称(不含扩展名)到机型编号的映射，1=机型A，2=机型B"
+            }
+        if "regions" not in data:
+            data["regions"] = {}
+        
+        # 決定要更新的機型
+        target_machine_id = "1"  # 預設機型
+        if video_name and machine_id:
+            target_machine_id = str(machine_id)
+            # 同時更新 video_machine_mapping
+            data["video_machine_mapping"][video_name] = machine_id
+        elif video_name:
+            # 如果只提供 video_name，嘗試從現有映射中獲取機型
+            mapping = data.get("video_machine_mapping", {})
+            if video_name in mapping:
+                target_machine_id = str(mapping[video_name])
+        
+        # 更新 regions 中對應機型的座標
+        for region_name, roi_coords in roi_dict.items():
+            if region_name not in data["regions"]:
+                # 初始化該區域，為兩種機型都創建空白配置
+                data["regions"][region_name] = {
+                    "1": [[], []],
+                    "2": [[], []]
+                }
+            
+            region_data = data["regions"][region_name]
+            
+            # 確保目標機型的結構存在
+            if target_machine_id not in region_data:
+                region_data[target_machine_id] = [[], []]
+            
+            # 獲取 header 座標（如果存在）
+            header_coords = []
+            if roi_header_dict and region_name in roi_header_dict:
+                header_coords = roi_header_dict[region_name]
+            elif isinstance(region_data.get(target_machine_id), list) and len(region_data[target_machine_id]) >= 2:
+                # 保留原有的 header 座標
+                header_coords = region_data[target_machine_id][1]
+            
+            # 更新座標：[[roi_coords], [header_coords]]
+            region_data[target_machine_id] = [roi_coords, header_coords]
+        
+        # 寫回文件
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        print(f"✓ ROI 設定已儲存至 {path}")
+        if video_name:
+            print(f"  視頻: {video_name}, 機型: {target_machine_id}")
+        return True
+        
+    except Exception as e:
+        print(f"✗ 儲存 ROI 設定失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

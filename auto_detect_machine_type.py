@@ -221,7 +221,7 @@ def extract_and_binarize_header(frame_bgr: np.ndarray, header_coords: List[int])
     # 二值化
     try:
         # 與 UI 相同：使用 rule 方法（S%<30 且 gray>150）
-        binary = binarize(header_bgr, method="rule", hsv_s_thresh=30, gray_thresh=150)
+        binary = binarize(header_bgr, hsv_s_thresh=30, gray_thresh=150)
         return binary
     except Exception as e:
         print(f"  ⚠️  二值化失敗: {e}")
